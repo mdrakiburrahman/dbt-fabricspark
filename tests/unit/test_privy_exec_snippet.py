@@ -1,7 +1,6 @@
 import ast
 import datetime as dt
 import json
-import sys
 import threading
 from types import SimpleNamespace
 
@@ -39,7 +38,13 @@ def test_snippet_sets_and_clears_job_group():
     assert "PRIVY_EXECUTION_SPAN " in snippet
     # clearJobGroup() is missing on some Fabric runtimes.
     assert "clearJobGroup" not in snippet
-    for prop in ("spark.jobGroup.id", "spark.job.description", "spark.job.interruptOnCancel"):
+    for prop in (
+        "spark.jobGroup.id",
+        "spark.job.description",
+        "spark.job.interruptOnCancel",
+        "openivm.request_id",
+        "openivm.node_id",
+    ):
         assert prop in snippet
 
 
@@ -186,6 +191,8 @@ def test_command_without_output_schema_skips_collect():
     assert _extract_execution_span(stdout) == payload["execution_span"]
     assert collected == []
     assert props["spark.jobGroup.id"] is None
+    assert props["openivm.request_id"] is None
+    assert props["openivm.node_id"] is None
 
 
 def test_query_with_output_schema_collects_rows():
@@ -197,6 +204,8 @@ def test_query_with_output_schema_collects_rows():
     assert _extract_execution_span(stdout) == payload["execution_span"]
     assert collected == [True]
     assert props["spark.jobGroup.id"] is None
+    assert props["openivm.request_id"] is None
+    assert props["openivm.node_id"] is None
 
 
 def test_execute_logs_structured_execution_span(monkeypatch):
@@ -365,16 +374,12 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
         request_ids.append(request_id)
         node_ids.append(node_id)
 
-    barrier_line = next(
-        number
-        for number, line in enumerate(snippets[0].splitlines(), start=1)
-        if "__privy_fields = [" in line
-    )
     barrier = threading.Barrier(thread_count)
     overlap_lock = threading.Lock()
     active_overlap = 0
     max_overlap = 0
-    thread_indices = {}
+    observed_props = {}
+    cleared_props = {}
     errors = []
 
     class _PrintCollector:
@@ -384,7 +389,7 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
 
         def __call__(self, value):
             with self.lock:
-                self.lines.append((thread_indices[threading.get_ident()], value))
+                self.lines.append((threading.get_ident(), value))
 
     class _Field:
         def __init__(self, name):
@@ -402,55 +407,49 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
 
     class _Ctx:
         def __init__(self):
-            self.props = {}
+            self._lock = threading.Lock()
+            self._props_by_thread = {}
 
         def setJobGroup(self, group, description, interrupt):
-            self.props["spark.jobGroup.id"] = group
+            self.setLocalProperty("spark.jobGroup.id", group)
 
         def setLocalProperty(self, key, value):
-            self.props[key] = value
+            with self._lock:
+                props = self._props_by_thread.setdefault(threading.get_ident(), {})
+                props[key] = value
+
+        def current_props(self):
+            with self._lock:
+                return dict(self._props_by_thread.get(threading.get_ident(), {}))
 
     class _Spark:
         def __init__(self):
             self.sparkContext = _Ctx()
 
         def sql(self, sql):
-            return _DF(int(sql.rsplit("value_", 1)[1]))
+            nonlocal active_overlap, max_overlap
+            idx = int(sql.rsplit("value_", 1)[1])
+            observed_props[idx] = self.sparkContext.current_props()
+            with overlap_lock:
+                active_overlap += 1
+                max_overlap = max(max_overlap, active_overlap)
+            try:
+                barrier.wait(timeout=5)
+            finally:
+                with overlap_lock:
+                    active_overlap -= 1
+            return _DF(idx)
 
     collector = _PrintCollector()
-    shared_env = {"spark": _Spark(), "print": collector, "__builtins__": __builtins__}
+    spark = _Spark()
+    shared_env = {"spark": spark, "print": collector, "__builtins__": __builtins__}
 
     def _worker(idx):
-        nonlocal active_overlap, max_overlap
-        paused = False
-        thread_indices[threading.get_ident()] = idx
-
-        def _trace(frame, event, arg):
-            nonlocal active_overlap, max_overlap, paused
-            if (
-                event == "line"
-                and frame.f_code.co_filename == "<string>"
-                and frame.f_lineno == barrier_line
-                and not paused
-            ):
-                paused = True
-                with overlap_lock:
-                    active_overlap += 1
-                    max_overlap = max(max_overlap, active_overlap)
-                try:
-                    barrier.wait(timeout=5)
-                finally:
-                    with overlap_lock:
-                        active_overlap -= 1
-            return _trace
-
         try:
-            sys.settrace(_trace)
             exec(snippets[idx], shared_env)  # noqa: S102 - shared-globals exec is under test
+            cleared_props[idx] = spark.sparkContext.current_props()
         except Exception as exc:  # pragma: no cover - asserted via errors
             errors.append(exc)
-        finally:
-            sys.settrace(None)
 
     threads = [threading.Thread(target=_worker, args=(idx,)) for idx in range(thread_count)]
     for thread in threads:
@@ -462,9 +461,22 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
     assert all(not thread.is_alive() for thread in threads)
     assert max_overlap > 1
 
+    marker_to_idx = {marker: idx for idx, marker in enumerate(markers)}
     outputs = {idx: [] for idx in range(thread_count)}
-    for idx, line in collector.lines:
-        outputs[idx].append(line)
+    thread_output_idx = {}
+    pending_lines = {}
+    for thread_id, line in collector.lines:
+        output_idx = thread_output_idx.get(thread_id)
+        if output_idx is None and line in marker_to_idx:
+            output_idx = marker_to_idx[line]
+            thread_output_idx[thread_id] = output_idx
+            outputs[output_idx].extend(pending_lines.pop(thread_id, []))
+        elif output_idx is None:
+            pending_lines.setdefault(thread_id, []).append(line)
+            continue
+        if output_idx is None:
+            continue
+        outputs[output_idx].append(line)
 
     for idx in range(thread_count):
         stdout = "\n".join(outputs[idx])
@@ -475,6 +487,12 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
         }
         _assert_execution_span(payload["execution_span"], request_ids[idx], node_ids[idx])
         assert _extract_execution_span(stdout) == payload["execution_span"]
+        assert observed_props[idx]["openivm.request_id"] == request_ids[idx]
+        assert observed_props[idx]["openivm.node_id"] == node_ids[idx]
+        assert observed_props[idx]["spark.jobGroup.id"] == node_ids[idx]
+        assert cleared_props[idx]["openivm.request_id"] is None
+        assert cleared_props[idx]["openivm.node_id"] is None
+        assert cleared_props[idx]["spark.jobGroup.id"] is None
 
     assert not any(
         key.startswith("__privy_exec_") or key.startswith("__privy_payload_") for key in shared_env
