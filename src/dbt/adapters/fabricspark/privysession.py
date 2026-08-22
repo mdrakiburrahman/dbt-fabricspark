@@ -70,6 +70,7 @@ _UNBOUNDED_TIMEOUT_S = 7 * 24 * 3600.0
 _JOB_TERMINAL_STATUSES = {"Completed", "Failed", "Cancelled", "Deduped"}
 _JOB_FAILURE_STATUSES = {"Failed", "Cancelled"}
 _PRIVY_EXECUTION_SPAN_PREFIX = "PRIVY_EXECUTION_SPAN "
+_PRIVY_TIMING_NEGATIVE_CLAMP_MS = 5
 
 
 def _import_relay_client() -> Any:
@@ -423,6 +424,30 @@ def _request_scope_for(request_id: str) -> str:
     return f"_{scope}" if scope[0].isdigit() else scope
 
 
+def _utc_iso(value: dt.datetime) -> str:
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _parse_utc_iso(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _duration_ms(start_tick: float, end_tick: float) -> int:
+    return int(round((end_tick - start_tick) * 1000))
+
+
+def _datetime_delta_ms(started_at: dt.datetime, completed_at: dt.datetime) -> int:
+    return int(round((completed_at - started_at).total_seconds() * 1000))
+
+
+def _clamp_tiny_negative_ms(value_ms: int) -> int:
+    if -_PRIVY_TIMING_NEGATIVE_CLAMP_MS <= value_ms < 0:
+        return 0
+    return value_ms
+
+
 def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None) -> str:
     """Build the Python snippet run (inprocess) on the notebook side.
 
@@ -553,6 +578,36 @@ def _log_execution_span(span: Optional[Dict[str, Any]]) -> None:
     logger.info(f"{_PRIVY_EXECUTION_SPAN_PREFIX}{json.dumps(span, sort_keys=True)}")
 
 
+def _enrich_execution_span(
+    server_span: Optional[Dict[str, Any]],
+    request_id: str,
+    node_id: Optional[str],
+    client_submitted_at: dt.datetime,
+    client_completed_at: dt.datetime,
+    client_duration_ms: int,
+) -> Dict[str, Any]:
+    span: Dict[str, Any] = dict(server_span or {})
+    span.setdefault("request_id", request_id)
+    span.setdefault("node_id", node_id)
+    span["client_submitted_at"] = _utc_iso(client_submitted_at)
+    span["client_completed_at"] = _utc_iso(client_completed_at)
+    span["client_duration_ms"] = client_duration_ms
+
+    server_started_at = _parse_utc_iso(span.get("server_started_at"))
+    if server_started_at is not None:
+        span["relay_wait_before_server_ms"] = _clamp_tiny_negative_ms(
+            _datetime_delta_ms(client_submitted_at, server_started_at)
+        )
+
+    server_completed_at = _parse_utc_iso(span.get("server_completed_at"))
+    if server_completed_at is not None:
+        span["relay_return_after_server_ms"] = _datetime_delta_ms(
+            server_completed_at, client_completed_at
+        )
+
+    return span
+
+
 class PrivyConnectionWrapper:
     """Connection wrapper for the privy (Azure Relay) connection method.
 
@@ -600,15 +655,44 @@ class PrivyConnectionWrapper:
             fixed_bindings = tuple(self._fix_binding(b) for b in bindings)
             sql = sql % fixed_bindings
 
+        node_id = _node_id_for(sql)
         request_id = uuid.uuid4().hex
         marker = f"__PRIVY_RESULT_{request_id}__"
         code = _build_exec_snippet(sql, marker, request_id=request_id)
         logger.debug(f"Submitting to Privy relay (inprocess): {sql}")
-        result = self._client.run_python(code, mode="inprocess", timeout_s=self._timeout_s)
+        client_submitted_at = dt.datetime.now(dt.timezone.utc)
+        client_submitted_tick = time.perf_counter()
+        try:
+            result = self._client.run_python(code, mode="inprocess", timeout_s=self._timeout_s)
+        except Exception:
+            client_completed_tick = time.perf_counter()
+            client_completed_at = dt.datetime.now(dt.timezone.utc)
+            _log_execution_span(
+                _enrich_execution_span(
+                    server_span=None,
+                    request_id=request_id,
+                    node_id=node_id,
+                    client_submitted_at=client_submitted_at,
+                    client_completed_at=client_completed_at,
+                    client_duration_ms=_duration_ms(client_submitted_tick, client_completed_tick),
+                )
+            )
+            raise
+        client_completed_tick = time.perf_counter()
+        client_completed_at = dt.datetime.now(dt.timezone.utc)
+        client_duration_ms = _duration_ms(client_submitted_tick, client_completed_tick)
         execution_span = _extract_execution_span(result.stdout)
+        logged_execution_span = _enrich_execution_span(
+            server_span=execution_span,
+            request_id=request_id,
+            node_id=node_id,
+            client_submitted_at=client_submitted_at,
+            client_completed_at=client_completed_at,
+            client_duration_ms=client_duration_ms,
+        )
 
         if not result.ok:
-            _log_execution_span(execution_span)
+            _log_execution_span(logged_execution_span)
             timeout_note = " (timed out)" if result.timed_out else ""
             raise DbtDatabaseError(
                 f"Error while executing query via Privy{timeout_note}: "
@@ -616,7 +700,16 @@ class PrivyConnectionWrapper:
             )
 
         payload = _extract_marked_json(result.stdout, marker)
-        _log_execution_span(payload.get("execution_span") or execution_span)
+        _log_execution_span(
+            _enrich_execution_span(
+                server_span=payload.get("execution_span") or execution_span,
+                request_id=request_id,
+                node_id=node_id,
+                client_submitted_at=client_submitted_at,
+                client_completed_at=client_completed_at,
+                client_duration_ms=client_duration_ms,
+            )
+        )
         self._rows = payload.get("data", [])
         self._schema = payload.get("schema", {}).get("fields", [])
         coerce_time_columns(self._rows, self._schema)
