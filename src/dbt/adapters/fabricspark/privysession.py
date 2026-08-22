@@ -69,6 +69,7 @@ _UNBOUNDED_TIMEOUT_S = 7 * 24 * 3600.0
 # https://learn.microsoft.com/en-us/rest/api/fabric/core/job-scheduler/get-item-job-instance
 _JOB_TERMINAL_STATUSES = {"Completed", "Failed", "Cancelled", "Deduped"}
 _JOB_FAILURE_STATUSES = {"Failed", "Cancelled"}
+_PRIVY_EXECUTION_SPAN_PREFIX = "PRIVY_EXECUTION_SPAN "
 
 
 def _import_relay_client() -> Any:
@@ -402,15 +403,27 @@ class PrivyConnectionManager:
 
 
 _NODE_ID_RE = re.compile(r'"node_id"\s*:\s*"([^"]+)"')
+_REQUEST_SCOPE_RE = re.compile(r"\W+")
+
+
+def _node_id_for(sql: str) -> Optional[str]:
+    match = _NODE_ID_RE.search(sql[:1024])
+    return match.group(1) if match else None
 
 
 def _job_group_for(sql: str) -> str:
     """Derive a Spark job-group id from dbt's query comment."""
-    match = _NODE_ID_RE.search(sql[:1024])
-    return match.group(1) if match else "dbt"
+    return _node_id_for(sql) or "dbt"
 
 
-def _build_exec_snippet(sql: str, marker: str) -> str:
+def _request_scope_for(request_id: str) -> str:
+    scope = _REQUEST_SCOPE_RE.sub("_", request_id)
+    if not scope:
+        return "_"
+    return f"_{scope}" if scope[0].isdigit() else scope
+
+
+def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None) -> str:
     """Build the Python snippet run (inprocess) on the notebook side.
 
     Runs ``spark.sql(sql)``, serializes the result into the same
@@ -429,54 +442,115 @@ def _build_exec_snippet(sql: str, marker: str) -> str:
     The job group is cleared via ``setLocalProperty(..., None)`` rather than
     ``clearJobGroup()`` because some Fabric runtimes do not expose the latter.
     """
-    sql_literal = json.dumps(sql)
-    marker_literal = json.dumps(marker)
-    group_literal = json.dumps(_job_group_for(sql))
-    description_literal = json.dumps(" ".join(sql.split())[:400])
+    request_id = request_id or marker
+    request_scope = _request_scope_for(request_id)
+    function_name = f"__privy_exec_{request_scope}"
+    payload_name = f"__privy_payload_{request_scope}"
+    sql_literal = repr(sql)
+    marker_literal = repr(marker)
+    request_id_literal = repr(request_id)
+    node_id_literal = repr(_node_id_for(sql))
+    group_literal = repr(_job_group_for(sql))
+    description_literal = repr(" ".join(sql.split())[:400])
+    span_prefix_literal = repr(_PRIVY_EXECUTION_SPAN_PREFIX)
     return (
-        "import json as __privy_json\n"
-        f"spark.sparkContext.setJobGroup({group_literal}, {description_literal}, True)\n"
-        "try:\n"
-        f"    __privy_df = spark.sql({sql_literal})\n"
-        "    __privy_fields = [\n"
-        "        {'name': __f.name, 'type': __f.dataType.simpleString(),"
+        f"def {function_name}():\n"
+        "    import datetime as __privy_datetime\n"
+        "    import time as __privy_time\n"
+        "    def __privy_iso(__privy_value):\n"
+        "        return __privy_value.isoformat(timespec='milliseconds').replace('+00:00', 'Z')\n"
+        f"    __privy_request_id = {request_id_literal}\n"
+        f"    __privy_node_id = {node_id_literal}\n"
+        "    __privy_started_at = __privy_datetime.datetime.now(__privy_datetime.timezone.utc)\n"
+        "    __privy_started_tick = __privy_time.perf_counter()\n"
+        "    __privy_payload = None\n"
+        f"    spark.sparkContext.setJobGroup({group_literal}, {description_literal}, True)\n"
+        "    try:\n"
+        f"        __privy_df = spark.sql({sql_literal})\n"
+        "        __privy_fields = [\n"
+        "            {'name': __f.name, 'type': __f.dataType.simpleString(),"
         " 'nullable': __f.nullable}\n"
-        "        for __f in __privy_df.schema.fields\n"
-        "    ]\n"
-        "    __privy_rows = (\n"
-        "        [list(__privy_row) for __privy_row in __privy_df.collect()]\n"
-        "        if __privy_fields\n"
-        "        else []\n"
-        "    )\n"
+        "            for __f in __privy_df.schema.fields\n"
+        "        ]\n"
+        "        __privy_rows = (\n"
+        "            [list(__privy_row) for __privy_row in __privy_df.collect()]\n"
+        "            if __privy_fields\n"
+        "            else []\n"
+        "        )\n"
+        "        __privy_payload = {'data': __privy_rows, 'schema': {'fields': __privy_fields}}\n"
+        "        return __privy_payload\n"
+        "    finally:\n"
+        "        try:\n"
+        "            __privy_completed_at = __privy_datetime.datetime.now(\n"
+        "                __privy_datetime.timezone.utc\n"
+        "            )\n"
+        "            __privy_span = {\n"
+        "                'request_id': __privy_request_id,\n"
+        "                'node_id': __privy_node_id,\n"
+        "                'server_started_at': __privy_iso(__privy_started_at),\n"
+        "                'server_completed_at': __privy_iso(__privy_completed_at),\n"
+        "                'server_duration_ms': int(\n"
+        "                    round((__privy_time.perf_counter() - __privy_started_tick) * 1000)\n"
+        "                ),\n"
+        "            }\n"
+        "            if __privy_payload is not None:\n"
+        "                __privy_payload['execution_span'] = __privy_span\n"
+        f"            print({span_prefix_literal} + __import__('json').dumps(__privy_span, sort_keys=True))\n"
+        "        finally:\n"
+        "            for __privy_prop in (\n"
+        "                'spark.jobGroup.id',\n"
+        "                'spark.job.description',\n"
+        "                'spark.job.interruptOnCancel',\n"
+        "            ):\n"
+        "                spark.sparkContext.setLocalProperty(__privy_prop, None)\n"
+        "try:\n"
+        f"    {payload_name} = {function_name}()\n"
+        f"    print({marker_literal})\n"
+        f"    print(__import__('json').dumps({payload_name}, default=str))\n"
+        f"    print({marker_literal})\n"
         "finally:\n"
-        "    for __privy_prop in ("
-        "'spark.jobGroup.id', 'spark.job.description', 'spark.job.interruptOnCancel'):\n"
-        "        spark.sparkContext.setLocalProperty(__privy_prop, None)\n"
-        f"print({marker_literal})\n"
-        "print(__privy_json.dumps("
-        "{'data': __privy_rows, 'schema': {'fields': __privy_fields}}, default=str))\n"
-        f"print({marker_literal})\n"
+        f"    globals().pop({payload_name!r}, None)\n"
+        f"    globals().pop({function_name!r}, None)\n"
     )
 
 
 def _extract_marked_json(stdout: str, marker: str) -> Dict[str, Any]:
-    start = stdout.find(marker)
-    if start == -1:
+    lines = stdout.splitlines()
+    marker_lines = [idx for idx, line in enumerate(lines) if line == marker]
+    if not marker_lines:
         raise DbtDatabaseError(
             f"Privy response is missing the result marker; stdout={stdout[-2000:]!r}"
         )
-    end = stdout.find(marker, start + len(marker))
-    if end == -1:
+    if len(marker_lines) < 2:
         raise DbtDatabaseError(
             f"Privy response is missing the closing result marker; stdout={stdout[-2000:]!r}"
         )
-    raw = stdout[start + len(marker) : end].strip()
+    raw = "\n".join(lines[marker_lines[0] + 1 : marker_lines[1]]).strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise DbtDatabaseError(
             f"Could not parse Privy result JSON ({exc}); raw={raw[:2000]!r}"
         ) from exc
+
+
+def _extract_execution_span(stdout: Optional[str]) -> Optional[Dict[str, Any]]:
+    for line in reversed((stdout or "").splitlines()):
+        if not line.startswith(_PRIVY_EXECUTION_SPAN_PREFIX):
+            continue
+        raw = line[len(_PRIVY_EXECUTION_SPAN_PREFIX) :].strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.debug(f"Could not parse Privy execution span JSON ({exc}); raw={raw[:2000]!r}")
+            return None
+    return None
+
+
+def _log_execution_span(span: Optional[Dict[str, Any]]) -> None:
+    if span is None:
+        return
+    logger.info(f"{_PRIVY_EXECUTION_SPAN_PREFIX}{json.dumps(span, sort_keys=True)}")
 
 
 class PrivyConnectionWrapper:
@@ -526,12 +600,15 @@ class PrivyConnectionWrapper:
             fixed_bindings = tuple(self._fix_binding(b) for b in bindings)
             sql = sql % fixed_bindings
 
-        marker = f"__PRIVY_RESULT_{uuid.uuid4().hex}__"
-        code = _build_exec_snippet(sql, marker)
+        request_id = uuid.uuid4().hex
+        marker = f"__PRIVY_RESULT_{request_id}__"
+        code = _build_exec_snippet(sql, marker, request_id=request_id)
         logger.debug(f"Submitting to Privy relay (inprocess): {sql}")
         result = self._client.run_python(code, mode="inprocess", timeout_s=self._timeout_s)
+        execution_span = _extract_execution_span(result.stdout)
 
         if not result.ok:
+            _log_execution_span(execution_span)
             timeout_note = " (timed out)" if result.timed_out else ""
             raise DbtDatabaseError(
                 f"Error while executing query via Privy{timeout_note}: "
@@ -539,6 +616,7 @@ class PrivyConnectionWrapper:
             )
 
         payload = _extract_marked_json(result.stdout, marker)
+        _log_execution_span(payload.get("execution_span") or execution_span)
         self._rows = payload.get("data", [])
         self._schema = payload.get("schema", {}).get("fields", [])
         coerce_time_columns(self._rows, self._schema)
