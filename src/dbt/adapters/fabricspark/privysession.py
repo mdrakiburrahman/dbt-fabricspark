@@ -424,6 +424,10 @@ def _request_scope_for(request_id: str) -> str:
     return f"_{scope}" if scope[0].isdigit() else scope
 
 
+def _scheduler_pool_for_request_id(request_id: str) -> str:
+    return f"privy_{_request_scope_for(request_id)[-24:]}"
+
+
 def _utc_iso(value: dt.datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -471,6 +475,7 @@ def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None)
     request_scope = _request_scope_for(request_id)
     function_name = f"__privy_exec_{request_scope}"
     payload_name = f"__privy_payload_{request_scope}"
+    pool_literal = repr(_scheduler_pool_for_request_id(request_id))
     sql_literal = repr(sql)
     marker_literal = repr(marker)
     request_id_literal = repr(request_id)
@@ -490,6 +495,7 @@ def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None)
         "    __privy_started_tick = __privy_time.perf_counter()\n"
         "    __privy_payload = None\n"
         f"    spark.sparkContext.setJobGroup({group_literal}, {description_literal}, True)\n"
+        f"    spark.sparkContext.setLocalProperty('spark.scheduler.pool', {pool_literal})\n"
         "    spark.sparkContext.setLocalProperty('openivm.request_id', __privy_request_id)\n"
         "    spark.sparkContext.setLocalProperty('openivm.node_id', __privy_node_id)\n"
         "    try:\n"
@@ -528,6 +534,7 @@ def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None)
         "                'spark.jobGroup.id',\n"
         "                'spark.job.description',\n"
         "                'spark.job.interruptOnCancel',\n"
+        "                'spark.scheduler.pool',\n"
         "                'openivm.request_id',\n"
         "                'openivm.node_id',\n"
         "            ):\n"

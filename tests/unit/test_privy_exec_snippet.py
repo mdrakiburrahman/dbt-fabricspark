@@ -14,6 +14,7 @@ from dbt.adapters.fabricspark.privysession import (
     _extract_execution_span,
     _extract_marked_json,
     _job_group_for,
+    _scheduler_pool_for_request_id,
 )
 
 CTAS = (
@@ -42,6 +43,7 @@ def test_snippet_sets_and_clears_job_group():
         "spark.jobGroup.id",
         "spark.job.description",
         "spark.job.interruptOnCancel",
+        "spark.scheduler.pool",
         "openivm.request_id",
         "openivm.node_id",
     ):
@@ -191,6 +193,7 @@ def test_command_without_output_schema_skips_collect():
     assert _extract_execution_span(stdout) == payload["execution_span"]
     assert collected == []
     assert props["spark.jobGroup.id"] is None
+    assert props["spark.scheduler.pool"] is None
     assert props["openivm.request_id"] is None
     assert props["openivm.node_id"] is None
 
@@ -204,6 +207,7 @@ def test_query_with_output_schema_collects_rows():
     assert _extract_execution_span(stdout) == payload["execution_span"]
     assert collected == [True]
     assert props["spark.jobGroup.id"] is None
+    assert props["spark.scheduler.pool"] is None
     assert props["openivm.request_id"] is None
     assert props["openivm.node_id"] is None
 
@@ -487,12 +491,20 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
         }
         _assert_execution_span(payload["execution_span"], request_ids[idx], node_ids[idx])
         assert _extract_execution_span(stdout) == payload["execution_span"]
+        assert observed_props[idx]["spark.scheduler.pool"] == _scheduler_pool_for_request_id(
+            request_ids[idx]
+        )
         assert observed_props[idx]["openivm.request_id"] == request_ids[idx]
         assert observed_props[idx]["openivm.node_id"] == node_ids[idx]
         assert observed_props[idx]["spark.jobGroup.id"] == node_ids[idx]
+        assert cleared_props[idx]["spark.scheduler.pool"] is None
         assert cleared_props[idx]["openivm.request_id"] is None
         assert cleared_props[idx]["openivm.node_id"] is None
         assert cleared_props[idx]["spark.jobGroup.id"] is None
+
+    assert (
+        len({props["spark.scheduler.pool"] for props in observed_props.values()}) == thread_count
+    )
 
     assert not any(
         key.startswith("__privy_exec_") or key.startswith("__privy_payload_") for key in shared_env
