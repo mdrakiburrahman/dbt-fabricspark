@@ -1,12 +1,17 @@
 import json
 import re
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import requests
 from dbt_common.exceptions import DbtDatabaseError
+from privy import executor as privy_executor
+from privy.client import ExecResult
+from privy.protocol import DEFAULT_POLL_WAIT_S, ExecRequest
 
+import dbt.adapters.fabricspark.privysession as privysession
 from dbt.adapters.fabricspark.connections import _is_permanent_error, _is_retryable_error
 from dbt.adapters.fabricspark.privysession import (
     PrivyConnectionWrapper,
@@ -55,6 +60,7 @@ class _BarrierRelayServer:
         self.fault_counts = {404: 0, 504: 0}
         self.cancelled = []
         self.poll_waits = []
+        self.request_ids = []
         self.scheduler_pools = set()
 
     def submit(self, request):
@@ -63,12 +69,14 @@ class _BarrierRelayServer:
         assert marker_match is not None
         assert node_match is not None
         request_id = marker_match.group(1)
+        assert request.request_id == request_id
         marker = marker_match.group(0)
         index = int(node_match.group(1))
         pool = _scheduler_pool_for_request_id(request_id)
         assert repr(pool) in request.code
         with self._lock:
             self.submit_count += 1
+            self.request_ids.append(request.request_id)
             job_id = f"job-{index}"
             self._jobs[job_id] = (index, marker)
             self.scheduler_pools.add(pool)
@@ -141,7 +149,8 @@ def test_32_requests_recover_16_404s_and_10_504s_without_resubmitting_sql():
     assert relay.poll_count == 58
     assert relay.cancelled == []
     assert len(relay.scheduler_pools) == 32
-    assert max(relay.poll_waits) <= 1.0
+    assert len(set(relay.request_ids)) == 32
+    assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S}
     assert [wrapper.fetchall() for wrapper in wrappers] == [[[index]] for index in range(32)]
 
 
@@ -193,7 +202,7 @@ class _CountingSpark:
         return _DataFrame()
 
 
-class _AmbiguousSubmitRelayServer:
+class _LegacyAmbiguousSubmitRelayServer:
     def __init__(self):
         self.spark = _CountingSpark()
         self._start_barrier = threading.Barrier(20)
@@ -207,6 +216,7 @@ class _AmbiguousSubmitRelayServer:
         }
         self.submit_attempts = 0
         self.transport_faults = 0
+        self.requests = []
         self.cancelled = []
 
     def _print(self, value):
@@ -228,6 +238,7 @@ class _AmbiguousSubmitRelayServer:
     def submit(self, request):
         with self._lock:
             self.submit_attempts += 1
+            self.requests.append(request)
             attempt = self.submit_attempts
             job_id = f"submit-{attempt}"
             job = {
@@ -268,8 +279,8 @@ class _AmbiguousSubmitRelayServer:
             job["thread"].join(timeout=10)
 
 
-def test_19_ambiguous_submit_retries_execute_materialization_once():
-    relay = _AmbiguousSubmitRelayServer()
+def test_legacy_server_notebook_dedupe_executes_ambiguous_submit_once():
+    relay = _LegacyAmbiguousSubmitRelayServer()
     wrapper = PrivyConnectionWrapper(relay, _credentials())
     wrapper.execute(
         '/* {"node_id": "model.relay.materialized_view"} */ '
@@ -281,6 +292,9 @@ def test_19_ambiguous_submit_retries_execute_materialization_once():
     assert relay.transport_faults == 19
     assert relay.spark.sql_calls == 1
     assert relay.cancelled == []
+    assert len({id(request) for request in relay.requests}) == 1
+    assert len({request.request_id for request in relay.requests}) == 1
+    assert relay.requests[0].request_id
     assert wrapper.fetchall() == [[7]]
     assert len(relay.spark.observed_properties) == 1
     properties = relay.spark.observed_properties[0]
@@ -295,6 +309,160 @@ def test_19_ambiguous_submit_retries_execute_materialization_once():
             re.search(r"__PRIVY_RESULT_[0-9a-f]+__", "\n".join(job["lines"])).group(0),
         )
         assert payload["data"] == [[7]]
+
+
+class _ProtocolIdempotentRelayServer:
+    def __init__(self):
+        self.submit_attempts = 0
+        self.transport_faults = 0
+        self.requests = []
+        self.wire_request_ids = []
+        self.job_ids = []
+        self.poll_waits = []
+        self.cancelled = []
+
+    def submit(self, request):
+        self.submit_attempts += 1
+        self.requests.append(request)
+        wire_request = ExecRequest.from_json(replace(request, action="submit").to_json())
+        self.wire_request_ids.append(wire_request.request_id)
+        response = privy_executor.execute(wire_request)
+        assert response.job_id
+        self.job_ids.append(response.job_id)
+        if self.submit_attempts <= 19:
+            self.transport_faults += 1
+            raise _http_error(504)
+        return response.job_id
+
+    def poll(self, request, job_id, *, wait_s):
+        self.poll_waits.append(wait_s)
+        response = privy_executor.execute(
+            ExecRequest.from_json(
+                replace(
+                    request,
+                    action="poll",
+                    job_id=job_id,
+                    wait_s=wait_s,
+                ).to_json()
+            )
+        )
+        return response.state, ExecResult.from_response(response)
+
+    def cancel(self, request, job_id):
+        self.cancelled.append(job_id)
+        response = privy_executor.execute(
+            ExecRequest.from_json(replace(request, action="cancel", job_id=job_id).to_json())
+        )
+        return ExecResult.from_response(response)
+
+
+def test_protocol_idempotency_reuses_one_job_for_19_ambiguous_submit_retries():
+    spark = _CountingSpark()
+    privy_executor.seed_inprocess_globals({"spark": spark})
+    relay = _ProtocolIdempotentRelayServer()
+    wrapper = PrivyConnectionWrapper(relay, _credentials())
+
+    wrapper.execute(
+        '/* {"node_id": "model.relay.protocol_materialized_view"} */ '
+        "create materialized view mv as select 7 as value"
+    )
+
+    assert relay.submit_attempts == 20
+    assert relay.transport_faults == 19
+    assert len({id(request) for request in relay.requests}) == 1
+    assert len({request.request_id for request in relay.requests}) == 1
+    assert relay.requests[0].request_id
+    assert set(relay.wire_request_ids) == {relay.requests[0].request_id}
+    assert len(set(relay.job_ids)) == 1
+    assert spark.sql_calls == 1
+    assert relay.cancelled == []
+    assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S}
+    assert wrapper.fetchall() == [[7]]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 100.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+
+
+class _ScriptedPollRelay:
+    def __init__(self, clock, running_durations):
+        self.clock = clock
+        self.running_durations = list(running_durations)
+        self.poll_waits = []
+        self.request = None
+
+    def submit(self, request):
+        self.request = request
+        return "job-poll"
+
+    def poll(self, request, job_id, *, wait_s):
+        assert request is self.request
+        assert job_id == "job-poll"
+        self.poll_waits.append(wait_s)
+        if self.running_durations:
+            self.clock.advance(self.running_durations.pop(0))
+            return "running", _exec_result()
+
+        marker = re.search(r"__PRIVY_RESULT_[0-9a-f]+__", request.code).group(0)
+        payload = {
+            "data": [[1]],
+            "schema": {"fields": [{"name": "value", "type": "int", "nullable": True}]},
+        }
+        return "done", _exec_result(stdout="\n".join((marker, json.dumps(payload), marker)))
+
+    def cancel(self, request, job_id):
+        raise AssertionError((request, job_id))
+
+
+def _use_clock(monkeypatch, clock):
+    monkeypatch.setattr(
+        privysession,
+        "time",
+        SimpleNamespace(
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            perf_counter=privysession.time.perf_counter,
+            time=privysession.time.time,
+        ),
+    )
+
+
+def test_completed_long_poll_does_not_add_client_side_sleep(monkeypatch):
+    clock = _Clock()
+    relay = _ScriptedPollRelay(clock, running_durations=[1.01])
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(poll_statement_wait=0.01))
+    wrapper.execute("select 1 as value")
+
+    assert relay.poll_waits == [DEFAULT_POLL_WAIT_S, DEFAULT_POLL_WAIT_S]
+    assert clock.sleeps == []
+    assert wrapper.fetchall() == [[1]]
+
+
+def test_immediate_legacy_polls_use_bounded_client_backoff(monkeypatch):
+    clock = _Clock()
+    relay = _ScriptedPollRelay(clock, running_durations=[0.0] * 6)
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(poll_statement_wait=0.01))
+    wrapper.execute("select 1 as value")
+
+    assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S}
+    assert clock.sleeps == [0.25, 0.5, 1.0, 2.0, 4.0, 5.0]
+    assert wrapper.fetchall() == [[1]]
 
 
 class _CancellableRelay:
@@ -347,10 +515,11 @@ def test_cancel_targets_the_active_relay_job():
 class _UnavailableRelay:
     def __init__(self):
         self.submit_count = 0
+        self.requests = []
 
     def submit(self, request):
-        del request
         self.submit_count += 1
+        self.requests.append(request)
         raise _http_error(404)
 
     def poll(self, request, job_id, *, wait_s):
@@ -371,6 +540,9 @@ def test_exhausted_relay_recovery_cannot_enter_outer_sql_retry_loop():
         wrapper.execute("create materialized view mv as select 1")
 
     assert relay.submit_count == 3
+    assert len({id(request) for request in relay.requests}) == 1
+    assert len({request.request_id for request in relay.requests}) == 1
+    assert relay.requests[0].request_id
     assert "refusing to resubmit SQL" in str(excinfo.value)
     assert "relay.invalid" not in str(excinfo.value)
     assert _is_retryable_error(excinfo.value) == ""

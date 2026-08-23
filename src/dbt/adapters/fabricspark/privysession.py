@@ -72,8 +72,9 @@ _JOB_FAILURE_STATUSES = {"Failed", "Cancelled"}
 _PRIVY_EXECUTION_SPAN_PREFIX = "PRIVY_EXECUTION_SPAN "
 _PRIVY_TIMING_NEGATIVE_CLAMP_MS = 5
 _PRIVY_TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
-_PRIVY_MAX_SERVER_POLL_WAIT_S = 1.0
 _PRIVY_CONTROL_GRACE_S = 60.0
+_PRIVY_POLL_BACKOFF_MIN_S = 0.25
+_PRIVY_POLL_BACKOFF_MAX_S = 5.0
 
 
 class PrivyTransportRetryError(DbtDatabaseError):
@@ -787,8 +788,6 @@ class PrivyConnectionWrapper:
         self._timeout_s = _query_timeout_s(credentials)
         self._connect_retries = max(0, int(getattr(credentials, "connect_retries", 0) or 0))
         self._connect_timeout_s = max(0.0, float(getattr(credentials, "connect_timeout", 0) or 0))
-        poll_wait_s = max(0.05, float(getattr(credentials, "poll_statement_wait", 0.5) or 0.5))
-        self._poll_wait_s = min(poll_wait_s, _PRIVY_MAX_SERVER_POLL_WAIT_S)
         self._rows: Optional[List] = None
         self._schema: Optional[List[Dict[str, Any]]] = None
         self._active_lock = threading.Lock()
@@ -872,13 +871,14 @@ class PrivyConnectionWrapper:
                 timeout_s=self._timeout_s,
             )
 
-        from privy.protocol import ExecRequest
+        from privy.protocol import DEFAULT_POLL_WAIT_S, ExecRequest
 
         request = ExecRequest(
             kind="python",
             code=code,
             mode="inprocess",
             timeout_s=self._timeout_s,
+            request_id=request_id,
         )
         job_id: Optional[str] = None
         deadline = (
@@ -889,7 +889,7 @@ class PrivyConnectionWrapper:
                 self._connect_retries * self._connect_timeout_s,
             )
         )
-        backoff_s = 0.05
+        backoff_s = _PRIVY_POLL_BACKOFF_MIN_S
         try:
             job_id = self._control_call(
                 "submit",
@@ -908,7 +908,7 @@ class PrivyConnectionWrapper:
                     lambda: self._client.poll(
                         request,
                         job_id,
-                        wait_s=self._poll_wait_s,
+                        wait_s=DEFAULT_POLL_WAIT_S,
                     ),
                 )
                 if state != "running":
@@ -919,11 +919,11 @@ class PrivyConnectionWrapper:
                         f"increase `statement_timeout` in profiles.yml if the query is "
                         f"expected to run longer."
                     )
-                if time.monotonic() - poll_started < 0.05:
+                if time.monotonic() - poll_started < 1.0:
                     time.sleep(backoff_s)
-                    backoff_s = min(backoff_s * 2, self._poll_wait_s)
+                    backoff_s = min(backoff_s * 2, _PRIVY_POLL_BACKOFF_MAX_S)
                 else:
-                    backoff_s = 0.05
+                    backoff_s = _PRIVY_POLL_BACKOFF_MIN_S
         except BaseException:
             if job_id is not None:
                 self._cancel_job(request, job_id)

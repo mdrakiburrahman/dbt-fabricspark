@@ -39,7 +39,7 @@ dependencies = [
     "azure-identity>=1.21.0",
     "azure-core>=1.33.0",
     "requests>=2.32.0",
-    "privy @ https://rakirahman.blob.core.windows.net/public/whls/privy-0.1.0-py3-none-any.whl",
+    "privy @ git+https://github.com/mdrakiburrahman/privy.git@0ed660adc77f22d2ec00553aa874cb9554ec59aa",
 ]
 
 [project.optional-dependencies]
@@ -121,4 +121,3 @@ ignore = ["E203", "E501", "E741"]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
-
