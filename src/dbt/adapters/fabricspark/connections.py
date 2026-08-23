@@ -586,7 +586,7 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
 
 def _is_retryable_error(exc: Exception) -> str:
-    if isinstance(exc, PrivyTransportRetryError):
+    if _is_permanent_error(exc):
         return ""
     message = str(exc).lower()
 

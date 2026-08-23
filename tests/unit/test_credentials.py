@@ -360,6 +360,7 @@ def test_spark_analysis_errors_are_permanent(error_code: str) -> None:
         f"Error while executing query: [{error_code}] deterministic analysis failure"
     )
     assert _is_permanent_error(exc) is True
+    assert _is_retryable_error(exc) == ""
 
 
 def test_schema_not_found_is_not_retryable() -> None:
