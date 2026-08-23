@@ -13,7 +13,7 @@ from dbt.adapters.fabricspark.privysession import (
     _extract_execution_span,
     _extract_marked_json,
     _job_group_for,
-    _scheduler_pool_for_request_id,
+    _scheduler_pool_for_node,
 )
 
 CTAS = (
@@ -490,8 +490,10 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
         }
         _assert_execution_span(payload["execution_span"], request_ids[idx], node_ids[idx])
         assert _extract_execution_span(stdout) == payload["execution_span"]
-        assert observed_props[idx]["spark.scheduler.pool"] == _scheduler_pool_for_request_id(
-            request_ids[idx]
+        # Pool names are model-stable (keyed by node_id), not request-id-scoped,
+        # so retries of the same model always land back in the same pool.
+        assert observed_props[idx]["spark.scheduler.pool"] == _scheduler_pool_for_node(
+            node_ids[idx], request_ids[idx]
         )
         assert observed_props[idx]["openivm.request_id"] == request_ids[idx]
         assert observed_props[idx]["openivm.node_id"] == node_ids[idx]

@@ -34,6 +34,7 @@ own. Cancelling it is entirely up to the caller.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -480,6 +481,112 @@ def _scheduler_pool_for_request_id(request_id: str) -> str:
     return f"privy_{_request_scope_for(request_id)[-24:]}"
 
 
+_MODEL_POOL_KEY_RE = re.compile(r"\W+")
+_MAX_MODEL_POOL_KEY_LEN = 40
+_MODEL_POOL_HASH_LEN = 8
+
+# Guards the two module-level pool-name registries below. They are
+# process-wide (shared by every PrivyConnectionWrapper/thread in one dbt
+# invocation) by design: a model can be retried from a different thread or a
+# fresh wrapper instance, and it must land back in the exact same scheduler
+# pool every time for a pre-declared allocation-file weight to keep applying.
+_pool_registry_lock = threading.Lock()
+# node_id -> resolved pool name, so retries of the same model are pool-stable.
+_pool_name_by_node: Dict[str, str] = {}
+# pool name -> the first node_id that claimed it, so an auto-derived name
+# never silently collides with a different model's pool (whether that pool
+# came from another auto-derivation or from an explicit override).
+_pool_owner_by_name: Dict[str, str] = {}
+
+
+def _model_key_for_node(node_id: str) -> str:
+    """Strip a dbt unique_id's ``<resource_type>.<package>.`` prefix.
+
+    dbt unique_ids for models are ``model.<package>.<name>`` (optionally
+    ``.v<version>`` for versioned models); the remainder is a short,
+    human-/operator-readable model name that stays identical across every
+    run and retry of that model. Falls back to the whole node_id for any
+    non-standard shape (fewer than 3 dot-segments).
+    """
+    parts = node_id.split(".")
+    return ".".join(parts[2:]) if len(parts) > 2 else node_id
+
+
+def _sanitize_pool_key(value: str) -> str:
+    key = _MODEL_POOL_KEY_RE.sub("_", value).strip("_")
+    if not key:
+        key = "_"
+    if key[0].isdigit():
+        key = f"_{key}"
+    return key[:_MAX_MODEL_POOL_KEY_LEN]
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:_MODEL_POOL_HASH_LEN]
+
+
+def _scheduler_pool_for_node(
+    node_id: Optional[str],
+    request_id: str,
+    pool_priority_map: Optional[Dict[str, str]] = None,
+) -> str:
+    """Resolve the deterministic ``spark.scheduler.pool`` name for a job.
+
+    Statements with no dbt ``node_id`` (ad hoc SQL that doesn't carry a
+    model's query-comment header) keep the pre-existing per-request
+    isolation scheme unchanged -- each such request still gets its own,
+    never-reused pool -- because there is no stable identity to key a
+    shared pool off of, and that isolation is what prevents
+    ``spark.scheduler.pool``/job-group/local-property bleed across
+    concurrent ``inprocess`` jobs (see the pool-isolation-per-request
+    feature this builds on).
+
+    Statements that DO carry a ``node_id`` instead get a *model-stable*
+    pool name: every execution/retry of the same model lands in the same
+    pool name, so an operator can pre-declare that exact name's weight in a
+    ``spark.scheduler.allocation.file`` and have it actually take effect --
+    Spark only honors a configured weight for pool names it saw when that
+    file was parsed at SparkContext start-up; any other name silently gets
+    a fresh, default-weight-1 pool (which is exactly what a fresh
+    per-request UUID name always was).
+
+    ``pool_priority_map`` is the opt-in model -> pool-name override carried
+    on ``FabricSparkCredentials.privy_pool_priority_map`` (looked up first
+    by the full node_id, then by its bare model name). Overrides are
+    honored verbatim -- including two different models deliberately
+    sharing one pool -- and are never hash-suffixed. Auto-derived names are
+    hash-suffixed only when they would otherwise collide with a
+    *different* node_id's pool (whether that pool came from another
+    auto-derivation or from an override), so two distinct, long model
+    names that truncate to the same prefix can never bleed into each
+    other's weight.
+    """
+    if not node_id:
+        return _scheduler_pool_for_request_id(request_id)
+
+    with _pool_registry_lock:
+        cached = _pool_name_by_node.get(node_id)
+        if cached is not None:
+            return cached
+
+        model_key = _model_key_for_node(node_id)
+        override = None
+        if pool_priority_map:
+            override = pool_priority_map.get(node_id) or pool_priority_map.get(model_key)
+
+        if override:
+            pool_name = override
+        else:
+            pool_name = f"privy_{_sanitize_pool_key(model_key)}"
+            existing_owner = _pool_owner_by_name.get(pool_name)
+            if existing_owner is not None and existing_owner != node_id:
+                pool_name = f"{pool_name}_{_short_hash(node_id)}"
+
+        _pool_owner_by_name.setdefault(pool_name, node_id)
+        _pool_name_by_node[node_id] = pool_name
+        return pool_name
+
+
 def _utc_iso(value: dt.datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -674,6 +781,7 @@ def _build_exec_snippet(
     marker: str,
     request_id: Optional[str] = None,
     timeout_s: float = _UNBOUNDED_TIMEOUT_S,
+    pool_priority_map: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build the Python snippet run (inprocess) on the notebook side.
 
@@ -698,11 +806,12 @@ def _build_exec_snippet(
     ``clearJobGroup()`` because some Fabric runtimes do not expose the latter.
     """
     request_id = request_id or marker
-    pool_literal = repr(_scheduler_pool_for_request_id(request_id))
+    node_id = _node_id_for(sql)
+    pool_literal = repr(_scheduler_pool_for_node(node_id, request_id, pool_priority_map))
     sql_literal = repr(sql)
     marker_literal = repr(marker)
     request_id_literal = repr(request_id)
-    node_id_literal = repr(_node_id_for(sql))
+    node_id_literal = repr(node_id)
     group_literal = repr(_job_group_for(sql))
     description_literal = repr(" ".join(sql.split())[:400])
     span_prefix_literal = repr(_PRIVY_EXECUTION_SPAN_PREFIX)
@@ -808,6 +917,9 @@ class PrivyConnectionWrapper:
         self._timeout_s = _query_timeout_s(credentials)
         self._connect_retries = max(0, int(getattr(credentials, "connect_retries", 0) or 0))
         self._connect_timeout_s = max(0.0, float(getattr(credentials, "connect_timeout", 0) or 0))
+        self._pool_priority_map: Dict[str, str] = dict(
+            getattr(credentials, "privy_pool_priority_map", None) or {}
+        )
         self._rows: Optional[List] = None
         self._schema: Optional[List[Dict[str, Any]]] = None
         self._active_lock = threading.Lock()
@@ -1038,6 +1150,7 @@ class PrivyConnectionWrapper:
             marker,
             request_id=request_id,
             timeout_s=self._timeout_s,
+            pool_priority_map=self._pool_priority_map,
         )
         logger.debug(f"Submitting to Privy relay (inprocess): {sql}")
         client_submitted_at = dt.datetime.now(dt.timezone.utc)

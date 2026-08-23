@@ -22,6 +22,35 @@
   transiently) falls back to the original sleep-then-retry loop, so the bounded
   `connect_retries` guarantee, cancel semantics, and exactly-once submission are
   unchanged.
+- Privy jobs that carry a dbt model's `node_id` (i.e. every compiled model
+  statement) now run in a deterministic, model-stable `spark.scheduler.pool`
+  instead of a fresh `uuid.uuid4()`-derived pool per `execute()` call. Forensics
+  from a 32-way local OpenIVM canary showed 28 Spark CPUs and a DAG-engine peak
+  of 22 concurrent requests all landing in distinct, never-reused, default
+  (weight=1) pools — every "Unknown pool" warning was a pool name that could
+  never have been pre-declared, because it never repeated. Spark's FAIR
+  scheduler only honors a `spark.scheduler.allocation.file`-declared weight for
+  a pool name it saw when the file was parsed at `SparkContext` start-up; any
+  other name silently gets a fresh, default-weight pool. With model-stable pool
+  names, an operator can now pre-declare per-model weights in that allocation
+  file — e.g. giving the observed critical path (`dim_customer` 245.953s →
+  `int_machine_status_transaction` 104.872s →
+  `fact_machine_status_monthly_snapshot` 131.581s) a heavier share of Spark's
+  fair-scheduler slots — and have them actually take effect, all while every
+  request still submits and is scheduled independently (no change to
+  concurrency, no serialization, no preemption). Every retry of the same model
+  is guaranteed to land back in the exact same pool (module-level, process-wide
+  cache keyed by `node_id`); two different models are guaranteed never to
+  collide on a truncated/sanitized pool name (a stable hash suffix is only
+  added on an actual collision); statements with no `node_id` keep the
+  pre-existing, fully isolated per-request pool naming unchanged. A new opt-in
+  `privy_pool_priority_map` profile field lets an operator override the
+  auto-derived name for specific models (by full `node_id` or bare model name,
+  e.g. to match a hand-authored allocation file, or to deliberately group
+  several models into one shared pool) — validated against the same character
+  set Spark itself allows in a pool name, defaults to empty (fully backward
+  compatible), and carries no adapter-hardcoded model/benchmark names of its
+  own.
 
 ## v1.13.0
 

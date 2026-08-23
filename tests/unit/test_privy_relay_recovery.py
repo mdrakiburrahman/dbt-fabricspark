@@ -17,7 +17,7 @@ from dbt.adapters.fabricspark.privysession import (
     PrivyConnectionWrapper,
     PrivyTransportRetryError,
     _extract_marked_json,
-    _scheduler_pool_for_request_id,
+    _scheduler_pool_for_node,
 )
 
 
@@ -72,7 +72,8 @@ class _BarrierRelayServer:
         assert request.request_id == request_id
         marker = marker_match.group(0)
         index = int(node_match.group(1))
-        pool = _scheduler_pool_for_request_id(request_id)
+        node_id = f"model.relay.value_{index}"
+        pool = _scheduler_pool_for_node(node_id, request_id)
         assert repr(pool) in request.code
         with self._lock:
             self.submit_count += 1

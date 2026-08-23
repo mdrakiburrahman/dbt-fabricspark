@@ -22,6 +22,11 @@ _ALLOWED_FABRIC_DOMAINS = [
     r"\.microsoftfabric\.com$",
 ]
 
+# Same character set Spark itself allows in a fair-scheduler pool name (and
+# what a hand-written spark.scheduler.allocation.file XML would declare), so
+# every configured override is guaranteed to match verbatim.
+_POOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]{1,63}$")
+
 # Mode types for Livy connection
 LivyMode = Literal["fabric", "local"]
 
@@ -148,6 +153,25 @@ class FabricSparkCredentials(Credentials):
     # trigger, or while waiting for a manually-started run) before giving up.
     # Independent of session_start_timeout (which is Livy-session-specific).
     privy_ready_timeout: int = 900
+    # Opt-in mapping from a dbt model name (or its full unique_id, e.g.
+    # "model.<project>.<name>") to an explicit Spark ``spark.scheduler.pool``
+    # name, for method=privy. Every privy job already runs in a deterministic,
+    # model-stable pool derived from its own model name (so retries of the
+    # same model always land back in the same pool); this map only lets an
+    # operator *override* that derived name for specific models — e.g. to
+    # match a pool that a ``spark.scheduler.allocation.file`` XML (loaded
+    # once, when the SparkContext started) declared with a non-default
+    # weight/minShare, or to deliberately group several models into one
+    # shared pool. The adapter never sends or interprets a weight itself —
+    # Spark's own FAIR scheduler resolves the pool *name* against whatever
+    # the allocation file declared, and treats any name (mapped or derived)
+    # absent from that file as a fresh, default-weight (1) pool. Leaving this
+    # empty (the default) reproduces that default-weight behavior for every
+    # model, so the map is entirely opt-in and carries no hardcoded model
+    # names of its own — callers supply their own evidence-based mapping via
+    # profile/env, e.g. ``{{ env_var('DBT_PRIVY_POOL_PRIORITY_MAP', '{}') |
+    # fromjson }}``.
+    privy_pool_priority_map: Dict[str, str] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         """Mask sensitive fields in repr to prevent credential leakage in logs/tracebacks."""
@@ -166,6 +190,7 @@ class FabricSparkCredentials(Credentials):
             f"privy_relay_path={self.privy_relay_path!r}, "
             f"privy_notebook_url={self.privy_notebook_url!r}, "
             f"privy_ready_timeout={self.privy_ready_timeout!r}, "
+            f"privy_pool_priority_map={self.privy_pool_priority_map!r}, "
             f"privy_relay_key='***', "
             f"accessToken='***')"
         )
@@ -239,6 +264,7 @@ class FabricSparkCredentials(Credentials):
                 raise DbtRuntimeError(
                     "Must specify `privy_notebook_url` in profile for method=privy"
                 )
+            self._validate_pool_priority_map()
 
         # schema defaults to lakehouse name if not provided by user.
         # For schema-enabled lakehouses, user can override this in profiles.yml.
@@ -375,6 +401,38 @@ class FabricSparkCredentials(Credentials):
                 f"Check your profiles.yml configuration."
             )
 
+    def _validate_pool_priority_map(self) -> None:
+        """Validate the opt-in ``privy_pool_priority_map`` profile field.
+
+        Keys are dbt model names or full unique_ids; values are literal Spark
+        ``spark.scheduler.pool`` names, so both must be non-empty strings and
+        every value must match the same safe character set Spark itself (and
+        a hand-authored allocation-file XML) would use for a pool name.
+        """
+        pool_map = self.privy_pool_priority_map
+        if not isinstance(pool_map, dict):
+            raise DbtRuntimeError(
+                f"privy_pool_priority_map must be a mapping of model name -> pool "
+                f"name (got: {type(pool_map).__name__})."
+            )
+        for key, pool_name in pool_map.items():
+            if not isinstance(key, str) or not key:
+                raise DbtRuntimeError(
+                    f"privy_pool_priority_map keys must be non-empty strings (got: {key!r})."
+                )
+            if not isinstance(pool_name, str) or not pool_name:
+                raise DbtRuntimeError(
+                    f"privy_pool_priority_map['{key}'] must be a non-empty string "
+                    f"pool name (got: {pool_name!r})."
+                )
+            if not _POOL_NAME_PATTERN.match(pool_name):
+                raise DbtRuntimeError(
+                    f"privy_pool_priority_map['{key}'] = {pool_name!r} is not a valid "
+                    f"Spark scheduler pool name. Pool names must match "
+                    f"{_POOL_NAME_PATTERN.pattern!r} (1-63 chars: letters, digits, "
+                    f"'.', '_', '-')."
+                )
+
     def _connection_keys(self) -> Tuple[str, ...]:
         # Intentionally excludes client_secret, accessToken, tenant_id,
         # privy_relay_key, privy_relay_keyrule
@@ -395,4 +453,5 @@ class FabricSparkCredentials(Credentials):
             "privy_notebook_url",
             "privy_auto_start_notebook",
             "privy_ready_timeout",
+            "privy_pool_priority_map",
         )
