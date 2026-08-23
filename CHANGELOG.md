@@ -8,6 +8,20 @@
   one server job, while notebook-interpreter deduplication remains as a fallback for
   older listeners. Polling uses Privy's bounded server-side long poll and adds client
   backoff only when an older listener responds immediately.
+- Fixed a 32-way local OpenIVM canary run showing a completed Spark job add tens of
+  seconds of pure client-side delay after a 504 on the poll's long-poll HTTP request
+  (33.182s on `stg_date_dim`, 107.805s across two 504s on
+  `fact_machine_status_monthly_snapshot`). A 504/408/etc. there is ambiguous — the
+  relay may have simply dropped the response to a job that already finished — but the
+  adapter treated it like any other transient failure and slept the fixed
+  `connect_timeout` before starting a brand new `DEFAULT_POLL_WAIT_S`-long poll for the
+  same job, even when the result was already sitting there. It now reacts to that
+  failure with one immediate, non-blocking status re-check of the same job/request id
+  first; a terminal result is used right away with no sleep and no new long poll. Only
+  a genuinely inconclusive re-check (job still running, or the probe itself fails
+  transiently) falls back to the original sleep-then-retry loop, so the bounded
+  `connect_retries` guarantee, cancel semantics, and exactly-once submission are
+  unchanged.
 
 ## v1.13.0
 

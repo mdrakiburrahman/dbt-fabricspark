@@ -150,7 +150,13 @@ def test_32_requests_recover_16_404s_and_10_504s_without_resubmitting_sql():
     assert relay.cancelled == []
     assert len(relay.scheduler_pools) == 32
     assert len(set(relay.request_ids)) == 32
-    assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S}
+    # Each of the 32 jobs takes one real long poll (wait_s=DEFAULT_POLL_WAIT_S);
+    # the 26 that hit a transient 404/504 are recovered by one immediate,
+    # non-blocking quick status probe (wait_s=_PRIVY_STATUS_PROBE_WAIT_S) each
+    # — never by sleeping and issuing a second full long poll.
+    assert relay.poll_waits.count(DEFAULT_POLL_WAIT_S) == 32
+    assert relay.poll_waits.count(privysession._PRIVY_STATUS_PROBE_WAIT_S) == 26
+    assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S, privysession._PRIVY_STATUS_PROBE_WAIT_S}
     assert [wrapper.fetchall() for wrapper in wrappers] == [[[index]] for index in range(32)]
 
 
@@ -463,6 +469,168 @@ def test_immediate_legacy_polls_use_bounded_client_backoff(monkeypatch):
     assert set(relay.poll_waits) == {DEFAULT_POLL_WAIT_S}
     assert clock.sleeps == [0.25, 0.5, 1.0, 2.0, 4.0, 5.0]
     assert wrapper.fetchall() == [[1]]
+
+
+class _AmbiguousPollRelay:
+    """Scripts a fixed sequence of outcomes for one submitted job's polls.
+
+    Each scripted outcome is ``("raise", status_code)`` — the long-poll HTTP
+    request itself fails transiently (e.g. an Azure Relay 504) — ``("running",
+    None)`` — a successful long poll observes the job genuinely still
+    running — or ``("done", None)`` — a successful (long or quick) poll finds
+    the job finished. Reproduces the runtime-forensics scenario: Spark/the
+    remote job actually finished, but the relay's response to the long poll
+    was lost, surfacing as a client-side transient HTTP error.
+    """
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.poll_waits = []
+        self.submit_count = 0
+        self.cancelled = []
+        self.request = None
+
+    def submit(self, request):
+        self.submit_count += 1
+        self.request = request
+        return "job-ambiguous"
+
+    def poll(self, request, job_id, *, wait_s):
+        assert request is self.request
+        assert job_id == "job-ambiguous"
+        self.poll_waits.append(wait_s)
+        kind, detail = self.outcomes.pop(0)
+        if kind == "raise":
+            raise _http_error(detail)
+        if kind == "running":
+            return "running", _exec_result()
+        marker = re.search(r"__PRIVY_RESULT_[0-9a-f]+__", request.code).group(0)
+        payload = {
+            "data": [[42]],
+            "schema": {"fields": [{"name": "value", "type": "int", "nullable": True}]},
+        }
+        return "done", _exec_result(stdout="\n".join((marker, json.dumps(payload), marker)))
+
+    def cancel(self, request, job_id):
+        self.cancelled.append(job_id)
+        return _exec_result()
+
+
+def test_504_after_job_already_done_uses_quick_probe_not_sleep_and_new_long_poll(monkeypatch):
+    """Reproduces the canary forensics: the long poll's HTTP response is lost
+    (surfaces as a 504) after Spark already finished the job. The adapter
+    must react with one immediate, non-blocking status re-check for the same
+    job — not the old fixed ``connect_timeout`` sleep followed by a brand new
+    ``DEFAULT_POLL_WAIT_S`` long poll — and must not resubmit the SQL.
+    """
+    clock = _Clock()
+    relay = _AmbiguousPollRelay(
+        [
+            ("raise", 504),  # long poll's HTTP response lost/ambiguous
+            ("done", None),  # but the job had actually already finished
+        ]
+    )
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(connect_timeout=10, connect_retries=1))
+    wrapper.execute("select 1 as value")
+
+    assert relay.poll_waits == [DEFAULT_POLL_WAIT_S, privysession._PRIVY_STATUS_PROBE_WAIT_S]
+    assert clock.sleeps == []
+    assert relay.submit_count == 1
+    assert relay.cancelled == []
+    assert wrapper.fetchall() == [[42]]
+
+
+def test_504_while_job_still_running_falls_back_to_sleep_then_new_long_poll(monkeypatch):
+    """When the quick status probe itself reports the job still running (a
+    genuine ambiguity, not a lost response), the adapter must fall back to
+    the original fixed sleep-then-retry loop instead of busy-looping.
+    """
+    clock = _Clock()
+    relay = _AmbiguousPollRelay(
+        [
+            ("raise", 504),  # long poll's HTTP response lost
+            ("running", None),  # quick probe: job is genuinely still running
+            ("done", None),  # next full long poll: job has since finished
+        ]
+    )
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(connect_timeout=10, connect_retries=1))
+    wrapper.execute("select 1 as value")
+
+    assert relay.poll_waits == [
+        DEFAULT_POLL_WAIT_S,
+        privysession._PRIVY_STATUS_PROBE_WAIT_S,
+        DEFAULT_POLL_WAIT_S,
+    ]
+    assert clock.sleeps == [10]
+    assert relay.submit_count == 1
+    assert relay.cancelled == []
+    assert wrapper.fetchall() == [[42]]
+
+
+def test_504_when_quick_probe_also_fails_falls_back_to_sleep_then_new_long_poll(monkeypatch):
+    """When the quick status probe itself hits a transient relay error (the
+    relay is genuinely unreachable, not just slow to answer one poll), the
+    adapter must fall back to the normal sleep-then-retry loop rather than
+    treating the probe failure as fatal or looping without backoff.
+    """
+    clock = _Clock()
+    relay = _AmbiguousPollRelay(
+        [
+            ("raise", 504),  # long poll's HTTP response lost
+            ("raise", 503),  # the immediate status re-check also fails transiently
+            ("done", None),  # next full long poll succeeds
+        ]
+    )
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(connect_timeout=10, connect_retries=1))
+    wrapper.execute("select 1 as value")
+
+    assert relay.poll_waits == [
+        DEFAULT_POLL_WAIT_S,
+        privysession._PRIVY_STATUS_PROBE_WAIT_S,
+        DEFAULT_POLL_WAIT_S,
+    ]
+    assert clock.sleeps == [10]
+    assert relay.submit_count == 1
+    assert relay.cancelled == []
+    assert wrapper.fetchall() == [[42]]
+
+
+def test_poll_exhausts_retries_when_quick_probe_never_resolves(monkeypatch):
+    """The quick-probe fast path must not weaken the existing bounded-retry
+    guarantee: if neither the long polls nor the quick probes ever resolve,
+    ``connect_retries`` is still honored and the job is still cancelled
+    exactly once, with no duplicate submission.
+    """
+    clock = _Clock()
+    relay = _AmbiguousPollRelay(
+        [
+            ("raise", 504),  # real long poll #1
+            ("raise", 504),  # quick probe #1 (also inconclusive)
+            ("raise", 504),  # real long poll #2 (last allowed retry)
+            ("raise", 504),  # quick probe #2 (also inconclusive) -> exhausted
+        ]
+    )
+    _use_clock(monkeypatch, clock)
+
+    wrapper = PrivyConnectionWrapper(relay, _credentials(connect_timeout=10, connect_retries=1))
+    with pytest.raises(PrivyTransportRetryError):
+        wrapper.execute("select 1 as value")
+
+    assert relay.poll_waits == [
+        DEFAULT_POLL_WAIT_S,
+        privysession._PRIVY_STATUS_PROBE_WAIT_S,
+        DEFAULT_POLL_WAIT_S,
+        privysession._PRIVY_STATUS_PROBE_WAIT_S,
+    ]
+    assert clock.sleeps == [10]
+    assert relay.submit_count == 1
+    assert relay.cancelled == ["job-ambiguous"]
 
 
 class _CancellableRelay:

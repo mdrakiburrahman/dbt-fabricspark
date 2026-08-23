@@ -18,7 +18,12 @@ stdout/stderr per thread and dispatches inprocess calls on a thread pool, so
 statements execute simultaneously against the notebook's shared ``spark``
 session (setting ``PRIVY_SERIALIZE_INPROCESS=1`` forces them back to
 one-at-a-time). Transient listener disconnects are retried against the same
-remote job, while ambiguous submits are deduplicated by request id.
+remote job, while ambiguous submits are deduplicated by request id. A
+transient failure on a poll's long-poll HTTP request is likewise ambiguous —
+the job may have already finished server-side and only the relay's response
+was lost — so it is first resolved with an immediate, non-blocking status
+re-check of the same job instead of sleeping and starting a brand new long
+poll; only a genuinely inconclusive re-check falls back to that sleep.
 
 The notebook run is never cancelled by this module (not even on process
 exit) — a filesystem cache (``privy-notebook-job.json`` in the cwd) lets
@@ -75,6 +80,21 @@ _PRIVY_TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
 _PRIVY_CONTROL_GRACE_S = 60.0
 _PRIVY_POLL_BACKOFF_MIN_S = 0.25
 _PRIVY_POLL_BACKOFF_MAX_S = 5.0
+
+# A 504/408/etc. on a poll's long-poll HTTP request is inherently ambiguous —
+# the relay may have dropped the response to an already-finished job. Rather
+# than sleeping ``connect_timeout`` seconds and starting a brand new
+# ``DEFAULT_POLL_WAIT_S``-long poll, we immediately re-check the same job with
+# a non-blocking (``wait_s=0``) status fetch. It is a plain read (same
+# request/job id, no resubmission), so it is safe to try before falling back
+# to the normal retry backoff.
+_PRIVY_STATUS_PROBE_WAIT_S = 0.0
+
+# Sentinel returned by ``_quick_status_probe`` when the immediate recheck
+# could not resolve the ambiguity (job still running, or the probe itself hit
+# a transient relay error) — signals ``_control_call`` to fall back to its
+# normal sleep-then-retry loop.
+_PROBE_INCONCLUSIVE = object()
 
 
 class PrivyTransportRetryError(DbtDatabaseError):
@@ -824,7 +844,26 @@ class PrivyConnectionWrapper:
     def fetchone(self) -> Optional[Any]:
         return self._rows[0] if self._rows else None
 
-    def _control_call(self, operation: str, request_id: str, call: Any) -> Any:
+    def _control_call(
+        self,
+        operation: str,
+        request_id: str,
+        call: Any,
+        quick_status_probe: Optional[Any] = None,
+    ) -> Any:
+        """Invoke ``call`` for ``operation``, retrying on transient relay errors.
+
+        A transient failure (HTTP 504/408/... or a dropped connection) is
+        ambiguous: the relay may simply have lost the response to a job that
+        already finished server-side. When ``quick_status_probe`` is given
+        (only the ``poll`` call site passes one) it is tried first, with no
+        sleep — a short, idempotent, non-blocking re-check of the *same*
+        job/request id. A terminal result from that probe is used
+        immediately instead of sleeping ``connect_timeout`` seconds and
+        starting a brand new long poll. Only when the probe is inconclusive
+        (job still running, or the probe itself fails transiently) do we
+        fall back to the original fixed sleep-then-retry loop.
+        """
         retries = 0
         while True:
             try:
@@ -832,6 +871,12 @@ class PrivyConnectionWrapper:
             except Exception as exc:
                 if not _is_transient_relay_error(exc):
                     raise
+                if quick_status_probe is not None:
+                    probe_outcome = self._quick_status_probe(
+                        operation, request_id, exc, quick_status_probe
+                    )
+                    if probe_outcome is not _PROBE_INCONCLUSIVE:
+                        return probe_outcome
                 if retries >= self._connect_retries:
                     raise PrivyTransportRetryError(
                         f"Privy relay {operation} failed after {retries + 1} attempt(s) "
@@ -846,6 +891,44 @@ class PrivyConnectionWrapper:
                 )
                 if self._connect_timeout_s:
                     time.sleep(self._connect_timeout_s)
+
+    def _quick_status_probe(
+        self,
+        operation: str,
+        request_id: str,
+        exc: Exception,
+        probe: Any,
+    ) -> Any:
+        """Try one non-blocking status re-check after a transient ``exc``.
+
+        Returns the probe's ``(state, result)`` outcome once the job is no
+        longer ``running``, or ``_PROBE_INCONCLUSIVE`` if the job is still
+        running or the probe itself raised a transient relay error (in which
+        case the caller falls back to its normal sleep-then-retry loop).
+        Non-transient probe errors propagate — this never widens the set of
+        exceptions treated as retryable.
+        """
+        try:
+            outcome = probe()
+        except Exception as probe_exc:
+            if not _is_transient_relay_error(probe_exc):
+                raise
+            logger.debug(
+                f"Privy relay {operation} got {_relay_error_label(exc)}; the immediate "
+                f"status re-check also failed ({_relay_error_label(probe_exc)}), falling "
+                f"back to the normal retry backoff. request_id={request_id}"
+            )
+            return _PROBE_INCONCLUSIVE
+        state, _ = outcome
+        if state == "running":
+            return _PROBE_INCONCLUSIVE
+        logger.info(
+            f"Privy relay {operation} got {_relay_error_label(exc)}, but an immediate "
+            f"status re-check found the job already finished; using that result instead "
+            f"of sleeping {self._connect_timeout_s:g}s and starting another long poll. "
+            f"request_id={request_id}"
+        )
+        return outcome
 
     def _cancel_job(self, request: Any, job_id: str) -> None:
         attempts = min(self._connect_retries, 2) + 1
@@ -909,6 +992,11 @@ class PrivyConnectionWrapper:
                         request,
                         job_id,
                         wait_s=DEFAULT_POLL_WAIT_S,
+                    ),
+                    quick_status_probe=lambda: self._client.poll(
+                        request,
+                        job_id,
+                        wait_s=_PRIVY_STATUS_PROBE_WAIT_S,
                     ),
                 )
                 if state != "running":
