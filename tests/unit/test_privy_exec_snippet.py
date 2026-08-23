@@ -1,4 +1,3 @@
-import ast
 import datetime as dt
 import json
 import threading
@@ -51,11 +50,11 @@ def test_snippet_sets_and_clears_job_group():
 
 
 def test_snippet_truncates_long_job_description():
-    snippet = _build_exec_snippet("select " + "x" * 5000, "MARKER")
-    description = ast.literal_eval(
-        snippet.split("setJobGroup(", 1)[1].split(", True)", 1)[0].split(", ", 1)[1]
-    )
+    sql = "select " + "x" * 5000
+    snippet = _build_exec_snippet(sql, "MARKER")
+    description = " ".join(sql.split())[:400]
     assert len(description) <= 400
+    assert repr(description) in snippet
 
 
 def _parse_utc_iso(value):
@@ -363,7 +362,7 @@ def test_execute_logs_best_available_execution_span_on_failure(monkeypatch):
 
 
 def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
-    thread_count = 4
+    thread_count = 32
     snippets = []
     markers = []
     request_ids = []
@@ -459,7 +458,7 @@ def test_concurrent_snippets_do_not_cross_contaminate_shared_globals():
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
+        thread.join(timeout=10)
 
     assert not errors
     assert all(not thread.is_alive() for thread in threads)

@@ -12,13 +12,13 @@ Fabric notebook cell is running in — so the notebook's pre-existing ``spark``
 session global is visible. Without ``inprocess``, ``spark`` would be
 undefined.
 
-This is a spike: no lakehouse schema-detection, no high-concurrency
-multi-REPL support, and no retry/backoff sophistication beyond a simple
-health-check + wait loop. Concurrent dbt threads do run in parallel — privy
-captures stdout/stderr per thread and dispatches inprocess calls on a thread
-pool, so statements execute simultaneously against the notebook's shared
-``spark`` session (setting ``PRIVY_SERIALIZE_INPROCESS=1`` forces them back
-to one-at-a-time).
+This is a spike: no lakehouse schema-detection or high-concurrency multi-REPL
+support. Concurrent dbt threads do run in parallel — privy captures
+stdout/stderr per thread and dispatches inprocess calls on a thread pool, so
+statements execute simultaneously against the notebook's shared ``spark``
+session (setting ``PRIVY_SERIALIZE_INPROCESS=1`` forces them back to
+one-at-a-time). Transient listener disconnects are retried against the same
+remote job, while ambiguous submits are deduplicated by request id.
 
 The notebook run is never cancelled by this module (not even on process
 exit) — a filesystem cache (``privy-notebook-job.json`` in the cwd) lets
@@ -71,6 +71,13 @@ _JOB_TERMINAL_STATUSES = {"Completed", "Failed", "Cancelled", "Deduped"}
 _JOB_FAILURE_STATUSES = {"Failed", "Cancelled"}
 _PRIVY_EXECUTION_SPAN_PREFIX = "PRIVY_EXECUTION_SPAN "
 _PRIVY_TIMING_NEGATIVE_CLAMP_MS = 5
+_PRIVY_TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
+_PRIVY_MAX_SERVER_POLL_WAIT_S = 1.0
+_PRIVY_CONTROL_GRACE_S = 60.0
+
+
+class PrivyTransportRetryError(DbtDatabaseError):
+    pass
 
 
 def _import_relay_client() -> Any:
@@ -100,6 +107,30 @@ def _query_timeout_s(credentials: FabricSparkCredentials) -> float:
     if credentials.statement_timeout and credentials.statement_timeout > 0:
         return float(credentials.statement_timeout)
     return _UNBOUNDED_TIMEOUT_S
+
+
+def _relay_error_status(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return int(status_code) if status_code is not None else None
+
+
+def _is_transient_relay_error(exc: Exception) -> bool:
+    status_code = _relay_error_status(exc)
+    if status_code is not None:
+        return status_code in _PRIVY_TRANSIENT_HTTP_STATUSES
+    return isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ),
+    )
+
+
+def _relay_error_label(exc: Exception) -> str:
+    status_code = _relay_error_status(exc)
+    return f"HTTP {status_code}" if status_code is not None else type(exc).__name__
 
 
 def _parse_notebook_ids(notebook_url: Optional[str]) -> Tuple[str, str]:
@@ -452,7 +483,177 @@ def _clamp_tiny_negative_ms(value_ms: int) -> int:
     return value_ms
 
 
-def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None) -> str:
+_PRIVY_DISPATCH_SOURCE = """
+def __privy_dispatch_v2(
+    __privy_spark,
+    __privy_sql,
+    __privy_marker,
+    __privy_request_id,
+    __privy_node_id,
+    __privy_group,
+    __privy_description,
+    __privy_pool,
+    __privy_span_prefix,
+    __privy_timeout_s,
+):
+    import datetime as __privy_datetime
+    import json as __privy_json
+    import threading as __privy_threading
+    import time as __privy_time
+
+    def __privy_iso(__privy_value):
+        return __privy_value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    __privy_globals = globals()
+    __privy_registry_lock = __privy_globals.setdefault(
+        "__privy_request_registry_lock_v2", __privy_threading.RLock()
+    )
+    __privy_registry = __privy_globals.setdefault("__privy_request_registry_v2", {})
+    __privy_now = __privy_time.monotonic()
+    with __privy_registry_lock:
+        for __privy_key, __privy_old_entry in list(__privy_registry.items()):
+            __privy_completed_tick = __privy_old_entry.get("completed_tick")
+            if (
+                __privy_completed_tick is not None
+                and __privy_now - __privy_completed_tick > 3600.0
+            ):
+                __privy_registry.pop(__privy_key, None)
+        __privy_entry = __privy_registry.get(__privy_request_id)
+        if __privy_entry is None:
+            __privy_entry = {
+                "event": __privy_threading.Event(),
+                "sql": __privy_sql,
+                "payload": None,
+                "error": None,
+                "completed_tick": None,
+            }
+            __privy_registry[__privy_request_id] = __privy_entry
+            __privy_owner = True
+        else:
+            if __privy_entry["sql"] != __privy_sql:
+                raise RuntimeError(
+                    "Privy request id was reused for different SQL: " + __privy_request_id
+                )
+            __privy_owner = False
+
+    if __privy_owner:
+        __privy_started_at = __privy_datetime.datetime.now(__privy_datetime.timezone.utc)
+        __privy_started_tick = __privy_time.perf_counter()
+        __privy_payload = None
+        __privy_error = None
+        try:
+            __privy_spark.sparkContext.setJobGroup(
+                __privy_group, __privy_description, True
+            )
+            __privy_spark.sparkContext.setLocalProperty(
+                "spark.scheduler.pool", __privy_pool
+            )
+            __privy_spark.sparkContext.setLocalProperty(
+                "openivm.request_id", __privy_request_id
+            )
+            __privy_spark.sparkContext.setLocalProperty(
+                "openivm.node_id", __privy_node_id
+            )
+            __privy_df = __privy_spark.sql(__privy_sql)
+            __privy_fields = [
+                {
+                    "name": __privy_field.name,
+                    "type": __privy_field.dataType.simpleString(),
+                    "nullable": __privy_field.nullable,
+                }
+                for __privy_field in __privy_df.schema.fields
+            ]
+            __privy_rows = (
+                [list(__privy_row) for __privy_row in __privy_df.collect()]
+                if __privy_fields
+                else []
+            )
+            __privy_payload = {
+                "data": __privy_rows,
+                "schema": {"fields": __privy_fields},
+            }
+        except BaseException as __privy_exc:
+            __privy_error = (type(__privy_exc).__name__, str(__privy_exc))
+            raise
+        finally:
+            __privy_completed_at = __privy_datetime.datetime.now(
+                __privy_datetime.timezone.utc
+            )
+            __privy_span = {
+                "request_id": __privy_request_id,
+                "node_id": __privy_node_id,
+                "server_started_at": __privy_iso(__privy_started_at),
+                "server_completed_at": __privy_iso(__privy_completed_at),
+                "server_duration_ms": int(
+                    round(
+                        (__privy_time.perf_counter() - __privy_started_tick) * 1000
+                    )
+                ),
+            }
+            if __privy_payload is not None:
+                __privy_payload["execution_span"] = __privy_span
+            try:
+                print(
+                    __privy_span_prefix
+                    + __privy_json.dumps(__privy_span, sort_keys=True)
+                )
+            finally:
+                try:
+                    for __privy_prop in (
+                        "spark.jobGroup.id",
+                        "spark.job.description",
+                        "spark.job.interruptOnCancel",
+                        "spark.scheduler.pool",
+                        "openivm.request_id",
+                        "openivm.node_id",
+                    ):
+                        __privy_spark.sparkContext.setLocalProperty(__privy_prop, None)
+                finally:
+                    with __privy_registry_lock:
+                        __privy_entry["payload"] = __privy_payload
+                        __privy_entry["error"] = __privy_error
+                        __privy_entry["completed_tick"] = __privy_time.monotonic()
+                        __privy_entry["event"].set()
+    else:
+        if not __privy_entry["event"].wait(
+            timeout=max(1.0, float(__privy_timeout_s) + 60.0)
+        ):
+            raise TimeoutError(
+                "Timed out waiting for in-flight Privy request "
+                + __privy_request_id
+            )
+        if __privy_entry["error"] is not None:
+            __privy_error_type, __privy_error_message = __privy_entry["error"]
+            raise RuntimeError(
+                "Original Privy request failed: "
+                + __privy_error_type
+                + ": "
+                + __privy_error_message
+            )
+        __privy_payload = __privy_entry["payload"]
+        if __privy_payload is None:
+            raise RuntimeError(
+                "Completed Privy request has no payload: " + __privy_request_id
+            )
+        __privy_span = __privy_payload.get("execution_span")
+        if __privy_span is not None:
+            print(
+                __privy_span_prefix
+                + __privy_json.dumps(__privy_span, sort_keys=True)
+            )
+
+    print(__privy_marker)
+    print(__privy_json.dumps(__privy_payload, default=str))
+    print(__privy_marker)
+"""
+
+
+def _build_exec_snippet(
+    sql: str,
+    marker: str,
+    request_id: Optional[str] = None,
+    timeout_s: float = _UNBOUNDED_TIMEOUT_S,
+) -> str:
     """Build the Python snippet run (inprocess) on the notebook side.
 
     Runs ``spark.sql(sql)``, serializes the result into the same
@@ -468,13 +669,14 @@ def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None)
     DDL/DML statements are executed eagerly by ``spark.sql`` and expose no
     output schema; collecting them would only round-trip an empty list.
 
+    Completed request ids remain cached briefly in the notebook interpreter,
+    so retrying a submit whose Relay response was lost returns the original
+    result without executing ``spark.sql`` again.
+
     The job group is cleared via ``setLocalProperty(..., None)`` rather than
     ``clearJobGroup()`` because some Fabric runtimes do not expose the latter.
     """
     request_id = request_id or marker
-    request_scope = _request_scope_for(request_id)
-    function_name = f"__privy_exec_{request_scope}"
-    payload_name = f"__privy_payload_{request_scope}"
     pool_literal = repr(_scheduler_pool_for_request_id(request_id))
     sql_literal = repr(sql)
     marker_literal = repr(marker)
@@ -483,70 +685,22 @@ def _build_exec_snippet(sql: str, marker: str, request_id: Optional[str] = None)
     group_literal = repr(_job_group_for(sql))
     description_literal = repr(" ".join(sql.split())[:400])
     span_prefix_literal = repr(_PRIVY_EXECUTION_SPAN_PREFIX)
+    timeout_literal = repr(timeout_s)
     return (
-        f"def {function_name}():\n"
-        "    import datetime as __privy_datetime\n"
-        "    import time as __privy_time\n"
-        "    def __privy_iso(__privy_value):\n"
-        "        return __privy_value.isoformat(timespec='milliseconds').replace('+00:00', 'Z')\n"
-        f"    __privy_request_id = {request_id_literal}\n"
-        f"    __privy_node_id = {node_id_literal}\n"
-        "    __privy_started_at = __privy_datetime.datetime.now(__privy_datetime.timezone.utc)\n"
-        "    __privy_started_tick = __privy_time.perf_counter()\n"
-        "    __privy_payload = None\n"
-        f"    spark.sparkContext.setJobGroup({group_literal}, {description_literal}, True)\n"
-        f"    spark.sparkContext.setLocalProperty('spark.scheduler.pool', {pool_literal})\n"
-        "    spark.sparkContext.setLocalProperty('openivm.request_id', __privy_request_id)\n"
-        "    spark.sparkContext.setLocalProperty('openivm.node_id', __privy_node_id)\n"
-        "    try:\n"
-        f"        __privy_df = spark.sql({sql_literal})\n"
-        "        __privy_fields = [\n"
-        "            {'name': __f.name, 'type': __f.dataType.simpleString(),"
-        " 'nullable': __f.nullable}\n"
-        "            for __f in __privy_df.schema.fields\n"
-        "        ]\n"
-        "        __privy_rows = (\n"
-        "            [list(__privy_row) for __privy_row in __privy_df.collect()]\n"
-        "            if __privy_fields\n"
-        "            else []\n"
-        "        )\n"
-        "        __privy_payload = {'data': __privy_rows, 'schema': {'fields': __privy_fields}}\n"
-        "        return __privy_payload\n"
-        "    finally:\n"
-        "        try:\n"
-        "            __privy_completed_at = __privy_datetime.datetime.now(\n"
-        "                __privy_datetime.timezone.utc\n"
-        "            )\n"
-        "            __privy_span = {\n"
-        "                'request_id': __privy_request_id,\n"
-        "                'node_id': __privy_node_id,\n"
-        "                'server_started_at': __privy_iso(__privy_started_at),\n"
-        "                'server_completed_at': __privy_iso(__privy_completed_at),\n"
-        "                'server_duration_ms': int(\n"
-        "                    round((__privy_time.perf_counter() - __privy_started_tick) * 1000)\n"
-        "                ),\n"
-        "            }\n"
-        "            if __privy_payload is not None:\n"
-        "                __privy_payload['execution_span'] = __privy_span\n"
-        f"            print({span_prefix_literal} + __import__('json').dumps(__privy_span, sort_keys=True))\n"
-        "        finally:\n"
-        "            for __privy_prop in (\n"
-        "                'spark.jobGroup.id',\n"
-        "                'spark.job.description',\n"
-        "                'spark.job.interruptOnCancel',\n"
-        "                'spark.scheduler.pool',\n"
-        "                'openivm.request_id',\n"
-        "                'openivm.node_id',\n"
-        "            ):\n"
-        "                spark.sparkContext.setLocalProperty(__privy_prop, None)\n"
-        "try:\n"
-        f"    {payload_name} = {function_name}()\n"
-        f"    print({marker_literal})\n"
-        f"    print(__import__('json').dumps({payload_name}, default=str))\n"
-        f"    print({marker_literal})\n"
-        "finally:\n"
-        f"    globals().pop({payload_name!r}, None)\n"
-        f"    globals().pop({function_name!r}, None)\n"
+        "if '__privy_dispatch_v2' not in globals():\n"
+        f"    exec({_PRIVY_DISPATCH_SOURCE!r}, globals())\n"
+        "globals()['__privy_dispatch_v2'](\n"
+        "    spark,\n"
+        f"    {sql_literal},\n"
+        f"    {marker_literal},\n"
+        f"    {request_id_literal},\n"
+        f"    {node_id_literal},\n"
+        f"    {group_literal},\n"
+        f"    {description_literal},\n"
+        f"    {pool_literal},\n"
+        f"    {span_prefix_literal},\n"
+        f"    {timeout_literal},\n"
+        ")\n"
     )
 
 
@@ -631,14 +785,27 @@ class PrivyConnectionWrapper:
     def __init__(self, relay_client: Any, credentials: FabricSparkCredentials) -> None:
         self._client = relay_client
         self._timeout_s = _query_timeout_s(credentials)
+        self._connect_retries = max(0, int(getattr(credentials, "connect_retries", 0) or 0))
+        self._connect_timeout_s = max(0.0, float(getattr(credentials, "connect_timeout", 0) or 0))
+        poll_wait_s = max(0.05, float(getattr(credentials, "poll_statement_wait", 0.5) or 0.5))
+        self._poll_wait_s = min(poll_wait_s, _PRIVY_MAX_SERVER_POLL_WAIT_S)
         self._rows: Optional[List] = None
         self._schema: Optional[List[Dict[str, Any]]] = None
+        self._active_lock = threading.Lock()
+        self._active_request: Any = None
+        self._active_job_id: Optional[str] = None
 
     def cursor(self) -> "PrivyConnectionWrapper":
         return self
 
     def cancel(self) -> None:
-        logger.debug("NotImplemented: cancel")
+        with self._active_lock:
+            request = self._active_request
+            job_id = self._active_job_id
+        if request is None or job_id is None:
+            logger.debug("No active Privy job to cancel")
+            return
+        self._cancel_job(request, job_id)
 
     def close(self) -> None:
         self._rows = None
@@ -658,6 +825,115 @@ class PrivyConnectionWrapper:
     def fetchone(self) -> Optional[Any]:
         return self._rows[0] if self._rows else None
 
+    def _control_call(self, operation: str, request_id: str, call: Any) -> Any:
+        retries = 0
+        while True:
+            try:
+                return call()
+            except Exception as exc:
+                if not _is_transient_relay_error(exc):
+                    raise
+                if retries >= self._connect_retries:
+                    raise PrivyTransportRetryError(
+                        f"Privy relay {operation} failed after {retries + 1} attempt(s) "
+                        f"({_relay_error_label(exc)}). The remote request may still be "
+                        f"running; refusing to resubmit SQL."
+                    ) from None
+                retries += 1
+                logger.warning(
+                    f"Privy relay {operation} got {_relay_error_label(exc)}; retrying the "
+                    f"same request/job ({retries}/{self._connect_retries}) in "
+                    f"{self._connect_timeout_s:g}s. request_id={request_id}"
+                )
+                if self._connect_timeout_s:
+                    time.sleep(self._connect_timeout_s)
+
+    def _cancel_job(self, request: Any, job_id: str) -> None:
+        attempts = min(self._connect_retries, 2) + 1
+        for attempt in range(attempts):
+            try:
+                self._client.cancel(request, job_id)
+                return
+            except Exception as exc:
+                if not _is_transient_relay_error(exc) or attempt == attempts - 1:
+                    logger.warning(
+                        f"Could not cancel Privy job {job_id}: {_relay_error_label(exc)}"
+                    )
+                    return
+                if self._connect_timeout_s:
+                    time.sleep(min(self._connect_timeout_s, 1.0))
+
+    def _run_python(self, code: str, request_id: str) -> Any:
+        job_methods = ("submit", "poll", "cancel")
+        if not all(callable(getattr(self._client, name, None)) for name in job_methods):
+            return self._client.run_python(
+                code,
+                mode="inprocess",
+                timeout_s=self._timeout_s,
+            )
+
+        from privy.protocol import ExecRequest
+
+        request = ExecRequest(
+            kind="python",
+            code=code,
+            mode="inprocess",
+            timeout_s=self._timeout_s,
+        )
+        job_id: Optional[str] = None
+        deadline = (
+            time.monotonic()
+            + self._timeout_s
+            + max(
+                _PRIVY_CONTROL_GRACE_S,
+                self._connect_retries * self._connect_timeout_s,
+            )
+        )
+        backoff_s = 0.05
+        try:
+            job_id = self._control_call(
+                "submit",
+                request_id,
+                lambda: self._client.submit(request),
+            )
+            with self._active_lock:
+                self._active_request = request
+                self._active_job_id = job_id
+
+            while True:
+                poll_started = time.monotonic()
+                state, result = self._control_call(
+                    "poll",
+                    request_id,
+                    lambda: self._client.poll(
+                        request,
+                        job_id,
+                        wait_s=self._poll_wait_s,
+                    ),
+                )
+                if state != "running":
+                    return result
+                if time.monotonic() >= deadline:
+                    raise DbtDatabaseError(
+                        f"Privy query exceeded statement_timeout={self._timeout_s:g}s; "
+                        f"increase `statement_timeout` in profiles.yml if the query is "
+                        f"expected to run longer."
+                    )
+                if time.monotonic() - poll_started < 0.05:
+                    time.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, self._poll_wait_s)
+                else:
+                    backoff_s = 0.05
+        except BaseException:
+            if job_id is not None:
+                self._cancel_job(request, job_id)
+            raise
+        finally:
+            with self._active_lock:
+                if self._active_job_id == job_id:
+                    self._active_request = None
+                    self._active_job_id = None
+
     def execute(self, sql: str, bindings: Optional[List[Any]] = None) -> None:
         sql = sql.strip()
         if sql.endswith(";"):
@@ -669,12 +945,17 @@ class PrivyConnectionWrapper:
         node_id = _node_id_for(sql)
         request_id = uuid.uuid4().hex
         marker = f"__PRIVY_RESULT_{request_id}__"
-        code = _build_exec_snippet(sql, marker, request_id=request_id)
+        code = _build_exec_snippet(
+            sql,
+            marker,
+            request_id=request_id,
+            timeout_s=self._timeout_s,
+        )
         logger.debug(f"Submitting to Privy relay (inprocess): {sql}")
         client_submitted_at = dt.datetime.now(dt.timezone.utc)
         client_submitted_tick = time.perf_counter()
         try:
-            result = self._client.run_python(code, mode="inprocess", timeout_s=self._timeout_s)
+            result = self._run_python(code, request_id)
         except Exception:
             client_completed_tick = time.perf_counter()
             client_completed_at = dt.datetime.now(dt.timezone.utc)
@@ -753,4 +1034,5 @@ class PrivyConnectionWrapper:
 __all__ = [
     "PrivyConnectionManager",
     "PrivyConnectionWrapper",
+    "PrivyTransportRetryError",
 ]

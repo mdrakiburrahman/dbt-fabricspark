@@ -37,7 +37,11 @@ from dbt.adapters.fabricspark.livysession import (
     LivySessionManager,
     get_lakehouse_properties,
 )
-from dbt.adapters.fabricspark.privysession import PrivyConnectionManager, PrivyConnectionWrapper
+from dbt.adapters.fabricspark.privysession import (
+    PrivyConnectionManager,
+    PrivyConnectionWrapper,
+    PrivyTransportRetryError,
+)
 from dbt.adapters.fabricspark.relation import FabricSparkRelation
 from dbt.adapters.sql import SQLConnectionManager
 
@@ -582,6 +586,8 @@ class FabricSparkConnectionManager(SQLConnectionManager):
 
 
 def _is_retryable_error(exc: Exception) -> str:
+    if isinstance(exc, PrivyTransportRetryError):
+        return ""
     message = str(exc).lower()
 
     # Client-side statement polling timeouts should NOT be retried — retrying
@@ -634,5 +640,7 @@ def _is_permanent_error(exc: Exception) -> bool:
     Permanent errors will never succeed on retry regardless of the ``retry_all``
     setting, so they must be excluded from the retry loop immediately.
     """
+    if isinstance(exc, PrivyTransportRetryError):
+        return True
     msg = str(exc).lower()
     return any(code in msg for code in _PERMANENT_SPARK_ERROR_CODES)

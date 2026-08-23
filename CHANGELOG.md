@@ -3,6 +3,10 @@
 ## v1.13.1
 
 - POC hack, do NOT merge
+- Fixed Privy listener reconnects and Relay 404/504 responses causing dbt to resubmit
+  already-running SQL. Control requests now retry the same remote job, polling holds a
+  RelayServer worker for at most one second, and ambiguous submits are deduplicated by
+  request id in the notebook interpreter.
 
 ## v1.13.0
 

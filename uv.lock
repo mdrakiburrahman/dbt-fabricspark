@@ -2655,7 +2655,7 @@ dependencies = [
     { name = "websocket-client" },
 ]
 wheels = [
-    { url = "https://rakirahman.blob.core.windows.net/public/whls/privy-0.1.0-py3-none-any.whl", hash = "sha256:777cfa492e6cc008cf5138364a44e9113cde6fecbe095cb4325263b38f8cbb70" },
+    { url = "https://rakirahman.blob.core.windows.net/public/whls/privy-0.1.0-py3-none-any.whl", hash = "sha256:8e2bb58a3eb64e7436bdc045ab2a75c349d17da0f86ad584f20ed9c2da562119" },
 ]
 
 [package.metadata]
