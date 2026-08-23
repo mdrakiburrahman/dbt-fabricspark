@@ -639,7 +639,10 @@ _PERMANENT_SPARK_ERROR_CODES = (
     "[invalid_identifier]",
     "[missing_aggregation]",
     "[group_by_aggregate]",
+    "[unable_to_acquire_memory]",
     "[unsupported_feature.",
+    "java.lang.outofmemoryerror",
+    "sparkoutofmemoryerror",
 )
 
 

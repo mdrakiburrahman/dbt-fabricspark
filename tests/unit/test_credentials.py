@@ -353,12 +353,20 @@ def test_table_or_view_not_found_is_permanent_error() -> None:
         "INVALID_IDENTIFIER",
         "MISSING_AGGREGATION",
         "GROUP_BY_AGGREGATE",
+        "UNABLE_TO_ACQUIRE_MEMORY",
     ],
 )
 def test_spark_analysis_errors_are_permanent(error_code: str) -> None:
     exc = DbtDatabaseError(
         f"Error while executing query: [{error_code}] deterministic analysis failure"
     )
+    assert _is_permanent_error(exc) is True
+    assert _is_retryable_error(exc) == ""
+
+
+@pytest.mark.parametrize("error_name", ["SparkOutOfMemoryError", "java.lang.OutOfMemoryError"])
+def test_spark_memory_errors_are_permanent(error_name: str) -> None:
+    exc = DbtDatabaseError(f"Error while executing query: {error_name}: Java heap space")
     assert _is_permanent_error(exc) is True
     assert _is_retryable_error(exc) == ""
 
