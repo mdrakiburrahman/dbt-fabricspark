@@ -631,6 +631,7 @@ def _is_retryable_error(exc: Exception) -> str:
 _PERMANENT_SPARK_ERROR_CODES = (
     "[schema_not_found]",
     "[table_or_view_not_found]",
+    "[table_or_view_already_exists]",
     "[unresolved_",
     "[ambiguous_",
     "[datatype_mismatch.",

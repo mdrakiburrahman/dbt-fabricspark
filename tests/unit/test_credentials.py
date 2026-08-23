@@ -347,6 +347,7 @@ def test_table_or_view_not_found_is_permanent_error() -> None:
         "UNRESOLVED_COLUMN.WITH_SUGGESTION",
         "UNRESOLVED_ROUTINE",
         "AMBIGUOUS_REFERENCE",
+        "TABLE_OR_VIEW_ALREADY_EXISTS",
         "DATATYPE_MISMATCH.BINARY_OP_DIFF_TYPES",
         "PARSE_SYNTAX_ERROR",
         "INVALID_IDENTIFIER",
