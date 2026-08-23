@@ -21,6 +21,15 @@ from dbt.adapters.fabricspark.privysession import (
 )
 
 
+def test_unsupported_feature_is_permanent_error() -> None:
+    exc = DbtDatabaseError(
+        "Error while executing query: "
+        "[UNSUPPORTED_FEATURE.PARTITION_WITH_NESTED_COLUMN_IS_UNSUPPORTED] "
+        "Invalid partitioning: `eventtime` is missing or is in a map or array."
+    )
+    assert _is_permanent_error(exc) is True
+
+
 def _credentials(**overrides):
     values = {
         "statement_timeout": 30,
