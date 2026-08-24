@@ -39,7 +39,7 @@ dependencies = [
     "azure-identity>=1.21.0",
     "azure-core>=1.33.0",
     "requests>=2.32.0",
-    "privy @ git+https://github.com/mdrakiburrahman/privy.git@0ed660adc77f22d2ec00553aa874cb9554ec59aa",
+    "privy @ git+https://github.com/mdrakiburrahman/privy.git@f15e2a4dec57798fce920e4250ce94c2a5a3453b",
 ]
 
 [project.optional-dependencies]

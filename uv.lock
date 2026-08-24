@@ -1915,7 +1915,7 @@ requires-dist = [
     { name = "dbt-adapters", specifier = ">=1.7,<2.0" },
     { name = "dbt-common", specifier = ">=1.10,<2.0" },
     { name = "dbt-core", specifier = ">=1.8.0" },
-    { name = "privy", git = "https://github.com/mdrakiburrahman/privy.git?rev=0ed660adc77f22d2ec00553aa874cb9554ec59aa" },
+    { name = "privy", git = "https://github.com/mdrakiburrahman/privy.git?rev=f15e2a4dec57798fce920e4250ce94c2a5a3453b" },
     { name = "requests", specifier = ">=2.32.0" },
 ]
 provides-extras = ["cli"]
@@ -2649,7 +2649,7 @@ wheels = [
 [[package]]
 name = "privy"
 version = "0.1.0"
-source = { git = "https://github.com/mdrakiburrahman/privy.git?rev=0ed660adc77f22d2ec00553aa874cb9554ec59aa#0ed660adc77f22d2ec00553aa874cb9554ec59aa" }
+source = { git = "https://github.com/mdrakiburrahman/privy.git?rev=f15e2a4dec57798fce920e4250ce94c2a5a3453b#f15e2a4dec57798fce920e4250ce94c2a5a3453b" }
 dependencies = [
     { name = "requests" },
     { name = "websocket-client" },
