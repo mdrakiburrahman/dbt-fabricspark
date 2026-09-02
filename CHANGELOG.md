@@ -33,6 +33,13 @@
   and exact job-detail request is capped by the remaining 30-second budget, with
   deadline checks before requests, between pages, and before sleeps so the
   interprocess ownership lock is released within the advertised bound.
+- Propagated that same reconciliation deadline through exact-Location cache
+  persistence and the global mapping-lock acquisition. Cache read/write,
+  `fsync`, and atomic `replace` recheck the original remaining budget instead of
+  opening a fresh 60-second lock window while notebook/target locks are held.
+  Exhaustion returns the same sanitized structured ambiguity evidence, leaves no
+  ownership entry or temporary file, and releases every lock within the original
+  reconciliation contract.
 - Fixed Privy listener reconnects and Relay 404/504 responses causing dbt to resubmit
   already-running SQL. Submit retries now reuse one protocol request id and therefore
   one server job, while notebook-interpreter deduplication remains as a fallback for

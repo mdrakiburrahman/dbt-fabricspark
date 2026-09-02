@@ -139,6 +139,12 @@ class PrivyNotebookSubmissionAmbiguousError(DbtRuntimeError):
         )
 
 
+class _PrivyOwnershipBudgetExceeded(DbtRuntimeError):
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(f"Privy notebook ownership budget expired during {stage}.")
+
+
 def _import_relay_client() -> Any:
     try:
         from privy import RelayClient
@@ -569,14 +575,21 @@ def _trigger_notebook_run(
         notebook_id,
     )
     target_id = _job_target_id(credentials)
-    with _notebook_scope_lock(workspace_id, notebook_id):
-        with _notebook_job_lock(workspace_id, notebook_id, target_id):
+    ownership_deadline = time.monotonic() + _JOB_LOCK_TIMEOUT_S
+    with _notebook_scope_lock(workspace_id, notebook_id, deadline=ownership_deadline):
+        with _notebook_job_lock(
+            workspace_id,
+            notebook_id,
+            target_id,
+            deadline=ownership_deadline,
+        ):
             return _trigger_notebook_run_locked(
                 credentials,
                 workspace_id,
                 notebook_id,
                 target_id,
                 correlation_token,
+                ownership_deadline,
             )
 
 
@@ -586,8 +599,14 @@ def _trigger_notebook_run_locked(
     notebook_id: str,
     target_id: str,
     correlation_token: str,
+    ownership_deadline: float,
 ) -> _NotebookJobRef:
-    cached_ref = _read_cached_job_ref(workspace_id, notebook_id, target_id)
+    cached_ref = _read_cached_job_ref(
+        workspace_id,
+        notebook_id,
+        target_id,
+        deadline=ownership_deadline,
+    )
     try:
         history = _list_item_job_instances(credentials, workspace_id, notebook_id)
     except requests.exceptions.RequestException as exc:
@@ -611,7 +630,7 @@ def _trigger_notebook_run_locked(
         return owned_active_ref
 
     if cached_ref is not None:
-        _clear_cached_job_ref(cached_ref)
+        _clear_cached_job_ref(cached_ref, deadline=ownership_deadline)
 
     url = (
         f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}"
@@ -651,6 +670,7 @@ def _trigger_notebook_run_locked(
             prior_job_ids,
             ambiguity_kind=ambiguous_error,
             response=response,
+            ownership_deadline=ownership_deadline,
         )
 
     if response is None:  # pragma: no cover - defensive
@@ -670,6 +690,7 @@ def _trigger_notebook_run_locked(
             prior_job_ids,
             ambiguity_kind=f"HTTP {response.status_code}",
             response=response,
+            ownership_deadline=ownership_deadline,
         )
     _require_job_response(
         "parameterized notebook submission", response, (200, 202), parameter_submission=True
@@ -690,6 +711,7 @@ def _trigger_notebook_run_locked(
             prior_job_ids,
             ambiguity_kind="accepted_without_job_id",
             response=response,
+            ownership_deadline=ownership_deadline,
         )
 
     job_ref = _NotebookJobRef(
@@ -699,7 +721,7 @@ def _trigger_notebook_run_locked(
         job_instance_id=job_instance_id,
         correlation_token=correlation_token,
     )
-    _cache_job_ref(job_ref)
+    _cache_job_ref(job_ref, deadline=ownership_deadline)
     logger.info(
         f"Notebook run triggered (HTTP {response.status_code}). "
         f"Job instance: {job_instance_id}. Waiting for the Privy relay to come up..."
@@ -765,13 +787,18 @@ def _reconcile_ambiguous_notebook_submission(
     *,
     ambiguity_kind: str,
     response: Optional[requests.Response],
+    ownership_deadline: float,
 ) -> _NotebookJobRef:
     # Fabric documents Location as the POST-to-job link. Job history's
     # rootActivityId is server-generated but is not documented as matching any
     # POST response/request header, so timing-only history entries are evidence,
     # never attribution.
     started_tick = time.monotonic()
-    deadline = started_tick + _JOB_RECONCILE_TIMEOUT_S
+    deadline = min(
+        ownership_deadline,
+        started_tick + _JOB_RECONCILE_TIMEOUT_S,
+    )
+    effective_budget_seconds = max(0.0, deadline - started_tick)
     location_job_instance_id = (
         _job_instance_id_from_response(response) if response is not None else None
     )
@@ -783,7 +810,7 @@ def _reconcile_ambiguous_notebook_submission(
         "target_id": target_id,
         "campaign_correlation_token": correlation_token,
         "submission_started_at": submission_started_at.isoformat(),
-        "budget_seconds": _JOB_RECONCILE_TIMEOUT_S,
+        "budget_seconds": effective_budget_seconds,
         "server_request_id": _response_request_id(response),
         "location_job_instance_id": location_job_instance_id,
         "post_retried": False,
@@ -856,7 +883,7 @@ def _reconcile_location_job_instance(
         remaining = _remaining_budget(deadline)
         if remaining is None or remaining <= 0:
             evidence["last_detail_error"] = last_error
-            evidence["elapsed_seconds"] = _JOB_RECONCILE_TIMEOUT_S
+            evidence["elapsed_seconds"] = evidence["budget_seconds"]
             raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
         try:
             job = _get_job_instance_status(
@@ -874,7 +901,7 @@ def _reconcile_location_job_instance(
             remaining_after_detail = _remaining_budget(deadline)
             if remaining_after_detail is None or remaining_after_detail <= 0:
                 evidence["location_validation"] = "detail_arrived_after_deadline"
-                evidence["elapsed_seconds"] = _JOB_RECONCILE_TIMEOUT_S
+                evidence["elapsed_seconds"] = evidence["budget_seconds"]
                 raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
             if (
                 job.get("id") != job_instance_id
@@ -884,7 +911,7 @@ def _reconcile_location_job_instance(
                 evidence["location_validation"] = "mismatch"
                 evidence["elapsed_seconds"] = max(
                     0.0,
-                    _JOB_RECONCILE_TIMEOUT_S - (_remaining_budget(deadline) or 0.0),
+                    evidence["budget_seconds"] - (_remaining_budget(deadline) or 0.0),
                 )
                 raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
             job_ref = _job_ref_from_instance(
@@ -894,7 +921,13 @@ def _reconcile_location_job_instance(
                 target_id=target_id,
                 correlation_token=correlation_token,
             )
-            _cache_job_ref(job_ref)
+            try:
+                _cache_job_ref(job_ref, deadline=deadline)
+            except _PrivyOwnershipBudgetExceeded as exc:
+                evidence["cache_persistence"] = "budget_exhausted"
+                evidence["cache_budget_stage"] = exc.stage
+                evidence["elapsed_seconds"] = evidence["budget_seconds"]
+                raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
             logger.info(
                 "Reconciled the ambiguous Fabric notebook submission through its "
                 f"server-returned Location job ID {job_ref.job_instance_id}."
@@ -966,41 +999,70 @@ def _thread_lock_for(path: str) -> threading.Lock:
 
 
 @contextmanager
-def _interprocess_file_lock(path: str) -> Iterator[None]:
+def _interprocess_file_lock(
+    path: str,
+    *,
+    deadline: Optional[float] = None,
+) -> Iterator[None]:
     if fcntl is None:
         raise DbtRuntimeError(
             "Privy notebook auto-start requires POSIX file locking; "
             "set privy_auto_start_notebook: false on unsupported platforms."
         )
+    effective_deadline = (
+        deadline if deadline is not None else time.monotonic() + _JOB_LOCK_TIMEOUT_S
+    )
     thread_lock = _thread_lock_for(path)
-    with thread_lock:
+    remaining = _require_remaining_budget(effective_deadline, "thread lock acquisition")
+    if not thread_lock.acquire(timeout=remaining):
+        raise _PrivyOwnershipBudgetExceeded("thread lock acquisition")
+    lock_file = None
+    file_locked = False
+    try:
+        _require_remaining_budget(effective_deadline, "file lock open")
         lock_file = open(path, "a+")
-        deadline = time.monotonic() + _JOB_LOCK_TIMEOUT_S
-        try:
-            while True:
-                try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise DbtRuntimeError(
-                            "Timed out waiting for the Privy notebook auto-start lock."
-                        ) from None
-                    time.sleep(min(_JOB_LOCK_POLL_S, remaining))
-            yield
-        finally:
+        while True:
             try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                file_locked = True
+                break
+            except BlockingIOError:
+                remaining = _require_remaining_budget(
+                    effective_deadline,
+                    "interprocess lock acquisition",
+                )
+                time.sleep(min(_JOB_LOCK_POLL_S, remaining))
+        yield
+    finally:
+        try:
+            if lock_file is not None and file_locked:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-            finally:
+        finally:
+            if lock_file is not None:
                 lock_file.close()
+            thread_lock.release()
+
+
+def _require_remaining_budget(deadline: float, stage: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise _PrivyOwnershipBudgetExceeded(stage)
+    return remaining
 
 
 @contextmanager
-def _notebook_scope_lock(workspace_id: str, notebook_id: str) -> Iterator[None]:
+def _notebook_scope_lock(
+    workspace_id: str,
+    notebook_id: str,
+    *,
+    deadline: Optional[float] = None,
+) -> Iterator[None]:
     raw_key = "\0".join((workspace_id, notebook_id))
     key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-    with _interprocess_file_lock(f"{_job_cache_path()}.{key}.notebook.lock"):
+    with _interprocess_file_lock(
+        f"{_job_cache_path()}.{key}.notebook.lock",
+        deadline=deadline,
+    ):
         yield
 
 
@@ -1009,15 +1071,23 @@ def _notebook_job_lock(
     workspace_id: str,
     notebook_id: str,
     target_id: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> Iterator[None]:
     key = _job_ref_cache_key(workspace_id, notebook_id, target_id)
-    with _interprocess_file_lock(f"{_job_cache_path()}.{key}.target.lock"):
+    with _interprocess_file_lock(
+        f"{_job_cache_path()}.{key}.target.lock",
+        deadline=deadline,
+    ):
         yield
 
 
 @contextmanager
-def _job_cache_mapping_lock() -> Iterator[None]:
-    with _interprocess_file_lock(f"{_job_cache_path()}.mapping.lock"):
+def _job_cache_mapping_lock(*, deadline: Optional[float] = None) -> Iterator[None]:
+    with _interprocess_file_lock(
+        f"{_job_cache_path()}.mapping.lock",
+        deadline=deadline,
+    ):
         yield
 
 
@@ -1053,16 +1123,30 @@ def _load_job_ref_mapping_unlocked() -> Dict[str, Any]:
     return data
 
 
-def _write_job_ref_mapping_unlocked(mapping: Dict[str, Any]) -> None:
+def _write_job_ref_mapping_unlocked(
+    mapping: Dict[str, Any],
+    *,
+    deadline: Optional[float] = None,
+) -> None:
     path = _job_cache_path()
     temp_path = f"{path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
     try:
+        _check_optional_budget(deadline, "cache file create")
         fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
+            _check_optional_budget(deadline, "cache write")
             json.dump(mapping, f, sort_keys=True)
             f.flush()
+            _check_optional_budget(deadline, "cache fsync")
             os.fsync(f.fileno())
+        _check_optional_budget(deadline, "cache replace")
         os.replace(temp_path, path)
+    except _PrivyOwnershipBudgetExceeded:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
     except OSError as exc:
         try:
             os.remove(temp_path)
@@ -1072,6 +1156,11 @@ def _write_job_ref_mapping_unlocked(mapping: Dict[str, Any]) -> None:
             "Could not atomically persist Privy notebook job ownership; "
             "refusing to continue without an interprocess-safe cache."
         ) from exc
+
+
+def _check_optional_budget(deadline: Optional[float], stage: str) -> None:
+    if deadline is not None:
+        _require_remaining_budget(deadline, stage)
 
 
 def _job_ref_from_cache_entry(
@@ -1108,10 +1197,14 @@ def _read_cached_job_ref(
     workspace_id: str,
     notebook_id: str,
     target_id: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> Optional[_NotebookJobRef]:
     key = _job_ref_cache_key(workspace_id, notebook_id, target_id)
-    with _job_cache_mapping_lock():
+    with _job_cache_mapping_lock(deadline=deadline):
+        _check_optional_budget(deadline, "cache read")
         mapping = _load_job_ref_mapping_unlocked()
+        _check_optional_budget(deadline, "cache read completion")
         entry = mapping["entries"].get(key)
     if entry is None:
         _job_refs_by_target.pop(key, None)
@@ -1126,7 +1219,11 @@ def _read_cached_job_ref(
     return job_ref
 
 
-def _cache_job_ref(job_ref: _NotebookJobRef) -> None:
+def _cache_job_ref(
+    job_ref: _NotebookJobRef,
+    *,
+    deadline: Optional[float] = None,
+) -> None:
     key = _job_ref_cache_key(
         job_ref.workspace_id,
         job_ref.notebook_id,
@@ -1139,20 +1236,27 @@ def _cache_job_ref(job_ref: _NotebookJobRef) -> None:
         "job_instance_id": job_ref.job_instance_id,
         "correlation_token": job_ref.correlation_token,
     }
-    with _job_cache_mapping_lock():
+    _check_optional_budget(deadline, "cache mapping lock")
+    with _job_cache_mapping_lock(deadline=deadline):
+        _check_optional_budget(deadline, "cache mapping read")
         mapping = _load_job_ref_mapping_unlocked()
         mapping["entries"][key] = entry
-        _write_job_ref_mapping_unlocked(mapping)
+        _write_job_ref_mapping_unlocked(mapping, deadline=deadline)
     _job_refs_by_target[key] = job_ref
 
 
-def _clear_cached_job_ref(job_ref: _NotebookJobRef) -> None:
+def _clear_cached_job_ref(
+    job_ref: _NotebookJobRef,
+    *,
+    deadline: Optional[float] = None,
+) -> None:
     key = _job_ref_cache_key(
         job_ref.workspace_id,
         job_ref.notebook_id,
         job_ref.target_id,
     )
-    with _job_cache_mapping_lock():
+    with _job_cache_mapping_lock(deadline=deadline):
+        _check_optional_budget(deadline, "cache clear read")
         mapping = _load_job_ref_mapping_unlocked()
         current = mapping["entries"].get(key)
         if isinstance(current, dict) and (
@@ -1160,7 +1264,7 @@ def _clear_cached_job_ref(job_ref: _NotebookJobRef) -> None:
             and current.get("correlation_token") == job_ref.correlation_token
         ):
             del mapping["entries"][key]
-            _write_job_ref_mapping_unlocked(mapping)
+            _write_job_ref_mapping_unlocked(mapping, deadline=deadline)
     cached = _job_refs_by_target.get(key)
     if cached == job_ref:
         _job_refs_by_target.pop(key, None)
@@ -1262,9 +1366,20 @@ def _validate_responding_relay_ownership(
         notebook_id,
     )
     target_id = _job_target_id(credentials)
-    with _notebook_scope_lock(workspace_id, notebook_id):
-        with _notebook_job_lock(workspace_id, notebook_id, target_id):
-            cached_ref = _read_cached_job_ref(workspace_id, notebook_id, target_id)
+    ownership_deadline = time.monotonic() + _JOB_LOCK_TIMEOUT_S
+    with _notebook_scope_lock(workspace_id, notebook_id, deadline=ownership_deadline):
+        with _notebook_job_lock(
+            workspace_id,
+            notebook_id,
+            target_id,
+            deadline=ownership_deadline,
+        ):
+            cached_ref = _read_cached_job_ref(
+                workspace_id,
+                notebook_id,
+                target_id,
+                deadline=ownership_deadline,
+            )
             try:
                 history = _list_item_job_instances(credentials, workspace_id, notebook_id)
             except requests.exceptions.RequestException as exc:

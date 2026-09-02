@@ -221,6 +221,14 @@ def _multiprocess_trigger_worker(
         result_queue.put(("error", token, type(exc).__name__, str(exc)))
 
 
+def _hold_mapping_lock(cache_path, acquired_event, release_event):
+    privysession._job_thread_locks.clear()
+    privysession._job_cache_path = lambda: cache_path
+    with privysession._job_cache_mapping_lock():
+        acquired_event.set()
+        release_event.wait(timeout=20)
+
+
 def _fork_context():
     try:
         return multiprocessing.get_context("fork")
@@ -618,6 +626,138 @@ def test_location_detail_mismatch_returns_only_structured_server_identifiers(mon
     assert privysession._read_cached_job_ref(WORKSPACE_ID, NOTEBOOK_ID, target_id) is None
     assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
     _assert_skill_header(calls)
+
+
+def test_location_detail_near_deadline_cannot_start_fresh_mapping_lock_budget(
+    monkeypatch,
+    _isolate_job_cache,
+):
+    context = _fork_context()
+    acquired_event = context.Event()
+    release_event = context.Event()
+    holder = context.Process(
+        target=_hold_mapping_lock,
+        args=(str(_isolate_job_cache), acquired_event, release_event),
+    )
+
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if len(calls) == 1:
+            return _Response(payload={"value": []})
+        if len(calls) == 2:
+            return _Response(
+                status_code=503,
+                headers={
+                    "Location": (
+                        "https://api.fabric.microsoft.com/v1/workspaces/"
+                        f"{WORKSPACE_ID}/items/{NOTEBOOK_ID}/jobs/instances/{JOB_ID}"
+                    )
+                },
+            )
+        assert kwargs["timeout"] == pytest.approx(30)
+        holder.start()
+        assert acquired_event.wait(timeout=10)
+        clock.advance(29.5)
+        return _Response(payload=_job(started=NOW))
+
+    monkeypatch.setattr(privysession.requests, "request", request)
+    monkeypatch.setattr(
+        privysession,
+        "get_headers",
+        lambda credentials: {"Authorization": "******"},
+    )
+    credentials = _credentials()
+    target_id = privysession._job_target_id(credentials)
+    try:
+        with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+            privysession._trigger_notebook_run(credentials)
+    finally:
+        release_event.set()
+        if holder.pid is not None:
+            holder.join(timeout=10)
+    assert holder.exitcode == 0
+
+    evidence = exc_info.value.evidence
+    assert evidence["cache_persistence"] == "budget_exhausted"
+    assert evidence["cache_budget_stage"] == "interprocess lock acquisition"
+    assert evidence["elapsed_seconds"] == pytest.approx(30)
+    assert clock.now == pytest.approx(130)
+    assert privysession._read_cached_job_ref(WORKSPACE_ID, NOTEBOOK_ID, target_id) is None
+    with privysession._notebook_scope_lock(
+        WORKSPACE_ID,
+        NOTEBOOK_ID,
+        deadline=clock.now + 1,
+    ):
+        with privysession._notebook_job_lock(
+            WORKSPACE_ID,
+            NOTEBOOK_ID,
+            target_id,
+            deadline=clock.now + 1,
+        ):
+            pass
+    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
+    _assert_skill_header(calls)
+
+
+def test_cache_write_budget_is_rechecked_before_fsync(monkeypatch, _isolate_job_cache):
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    original_dump = privysession.json.dump
+
+    def slow_dump(*args, **kwargs):
+        original_dump(*args, **kwargs)
+        clock.advance(1)
+
+    monkeypatch.setattr(privysession.json, "dump", slow_dump)
+    job_ref = privysession._NotebookJobRef(
+        workspace_id=WORKSPACE_ID,
+        notebook_id=NOTEBOOK_ID,
+        target_id=privysession._job_target_id(_credentials()),
+        job_instance_id=JOB_ID,
+        correlation_token="campaign-central-frozen",
+    )
+
+    with pytest.raises(privysession._PrivyOwnershipBudgetExceeded) as exc_info:
+        privysession._cache_job_ref(job_ref, deadline=clock.now + 1)
+
+    assert exc_info.value.stage == "cache fsync"
+    assert not _isolate_job_cache.exists()
+    assert list(_isolate_job_cache.parent.glob("*.tmp-*")) == []
+
+
+def test_cache_write_budget_is_rechecked_before_replace(monkeypatch, _isolate_job_cache):
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    original_fsync = privysession.os.fsync
+
+    def slow_fsync(fd):
+        original_fsync(fd)
+        clock.advance(1)
+
+    monkeypatch.setattr(privysession.os, "fsync", slow_fsync)
+    monkeypatch.setattr(
+        privysession.os,
+        "replace",
+        lambda *args: pytest.fail("replace must not run after the budget expires"),
+    )
+    job_ref = privysession._NotebookJobRef(
+        workspace_id=WORKSPACE_ID,
+        notebook_id=NOTEBOOK_ID,
+        target_id=privysession._job_target_id(_credentials()),
+        job_instance_id=JOB_ID,
+        correlation_token="campaign-central-frozen",
+    )
+
+    with pytest.raises(privysession._PrivyOwnershipBudgetExceeded) as exc_info:
+        privysession._cache_job_ref(job_ref, deadline=clock.now + 1)
+
+    assert exc_info.value.stage == "cache replace"
+    assert not _isolate_job_cache.exists()
+    assert list(_isolate_job_cache.parent.glob("*.tmp-*")) == []
 
 
 @pytest.mark.parametrize("status_code", [408, 500, 502, 503, 504])
