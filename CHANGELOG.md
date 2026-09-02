@@ -21,9 +21,18 @@
   cache loss, another campaign, or multiple active jobs fail closed. A keyed
   atomic cache and per-workspace/notebook/Relay-target interprocess lock cover
   cache recheck, paginated history, one POST, reconciliation, and persistence.
-  Ambiguous transport failures plus HTTP 408/5xx responses reconcile only a
-  single new bounded-history job without resubmitting, while deterministic 4xx
+  Ambiguous transport failures plus HTTP 408/5xx responses enter bounded
+  evidence reconciliation without resubmitting, while deterministic 4xx
   failures remain fail-closed.
+- Removed timing-only attribution from ambiguous notebook submission handling.
+  Only the server-returned `Location` job-instance ID can establish ownership;
+  `rootActivityId`, request IDs, and newly appearing history entries are retained
+  as sanitized structured ambiguity evidence but are never treated as a
+  documented POST correlation. Ambiguities without `Location` now fail safely
+  without retrying, adopting, cancelling, or caching any job. Every history page
+  and exact job-detail request is capped by the remaining 30-second budget, with
+  deadline checks before requests, between pages, and before sleeps so the
+  interprocess ownership lock is released within the advertised bound.
 - Fixed Privy listener reconnects and Relay 404/504 responses causing dbt to resubmit
   already-running SQL. Submit retries now reuse one protocol request id and therefore
   one server job, while notebook-interpreter deduplication remains as a fallback for

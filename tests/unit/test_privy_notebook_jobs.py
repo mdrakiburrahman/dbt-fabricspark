@@ -4,6 +4,7 @@ import multiprocessing
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -43,6 +44,35 @@ class _Logger:
 
     def warning(self, message):
         self.messages.append(str(message))
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 100.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _use_clock(monkeypatch, clock):
+    monkeypatch.setattr(
+        privysession,
+        "time",
+        SimpleNamespace(
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            time=lambda: clock.now,
+            perf_counter=clock.monotonic,
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -430,6 +460,7 @@ def test_successful_post_caches_returned_job_id_immediately(monkeypatch):
             _Response(payload={"value": []}),
             _Response(
                 status_code=202,
+                payload={"id": JOB_ID},
                 headers={
                     "Location": (
                         "https://api.fabric.microsoft.com/v1/workspaces/"
@@ -457,15 +488,15 @@ def test_successful_post_caches_returned_job_id_immediately(monkeypatch):
     _assert_skill_header(calls)
 
 
-def test_accepted_post_without_location_id_reconciles_instead_of_using_notebook_id(
-    monkeypatch,
-):
+def test_accepted_post_without_location_id_fails_without_timing_only_adoption(monkeypatch):
+    monkeypatch.setattr(privysession, "_JOB_RECONCILE_TIMEOUT_S", 0)
     calls = _install_requests(
         monkeypatch,
         [
             _Response(payload={"value": []}),
             _Response(
                 status_code=202,
+                payload={"id": JOB_ID},
                 headers={
                     "Location": (
                         "https://api.fabric.microsoft.com/v1/workspaces/"
@@ -474,26 +505,74 @@ def test_accepted_post_without_location_id_reconciles_instead_of_using_notebook_
                     )
                 },
             ),
-            _Response(payload={"value": [_job(started=NOW)]}),
         ],
     )
 
-    job_ref = privysession._trigger_notebook_run(_credentials())
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+        privysession._trigger_notebook_run(_credentials())
 
-    assert job_ref.job_instance_id == JOB_ID
-    assert job_ref.job_instance_id != NOTEBOOK_ID
-    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
+    assert exc_info.value.evidence["location_job_instance_id"] is None
+    assert exc_info.value.evidence["post_retried"] is False
+    assert exc_info.value.evidence["cancel_attempted"] is False
+    assert [method for method, _, _ in calls] == ["GET", "POST"]
     assert sum(method == "POST" for method, _, _ in calls) == 1
     _assert_skill_header(calls)
 
 
-def test_ambiguous_post_reconciles_once_without_retrying_post(monkeypatch):
+def test_ambiguous_post_never_adopts_unrelated_then_later_submitted_timing_matches(
+    monkeypatch,
+):
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    monkeypatch.setattr(privysession, "_JOB_RECONCILE_TIMEOUT_S", 2)
+    credentials = _credentials()
+    target_id = privysession._job_target_id(credentials)
     calls = _install_requests(
         monkeypatch,
         [
             _Response(payload={"value": []}),
             requests.Timeout("ambiguous submit"),
-            _Response(payload={"value": [_job(started=NOW)]}),
+            _Response(payload={"value": [_job(OTHER_JOB_ID, started=NOW)]}),
+            _Response(
+                payload={
+                    "value": [
+                        _job(OTHER_JOB_ID, started=NOW),
+                        _job(JOB_ID, started=NOW),
+                    ]
+                }
+            ),
+        ],
+    )
+
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+        privysession._trigger_notebook_run(credentials)
+
+    observed_ids = {job["job_instance_id"] for job in exc_info.value.evidence["observed_new_jobs"]}
+    assert observed_ids == {JOB_ID, OTHER_JOB_ID}
+    assert privysession._read_cached_job_ref(WORKSPACE_ID, NOTEBOOK_ID, target_id) is None
+    assert [method for method, _, _ in calls] == ["GET", "POST", "GET", "GET"]
+    assert sum(method == "POST" for method, _, _ in calls) == 1
+    assert clock.sleeps == [1, 1]
+    _assert_skill_header(calls)
+
+
+def test_ambiguous_http_response_with_location_reconciles_only_that_exact_job(monkeypatch):
+    calls = _install_requests(
+        monkeypatch,
+        [
+            _Response(payload={"value": []}),
+            _Response(
+                status_code=503,
+                payload={"errorCode": "TransientFailure"},
+                headers={
+                    "Location": (
+                        "https://api.fabric.microsoft.com/v1/workspaces/"
+                        f"{WORKSPACE_ID}/items/{NOTEBOOK_ID}/jobs/instances/{JOB_ID}"
+                    ),
+                    "x-ms-request-id": OTHER_JOB_ID,
+                },
+            ),
+            _Response(payload=_job(started=NOW)),
         ],
     )
 
@@ -505,45 +584,142 @@ def test_ambiguous_post_reconciles_once_without_retrying_post(monkeypatch):
     _assert_skill_header(calls)
 
 
-def test_ambiguous_post_history_retry_keeps_header_and_never_retries_post(monkeypatch):
-    monkeypatch.setattr(privysession, "_JOB_RECONCILE_POLL_S", 0)
+def test_location_detail_mismatch_returns_only_structured_server_identifiers(monkeypatch):
+    credentials = _credentials()
+    target_id = privysession._job_target_id(credentials)
     calls = _install_requests(
         monkeypatch,
         [
             _Response(payload={"value": []}),
-            requests.ConnectionError("ambiguous submit"),
-            _Response(status_code=429, payload={"errorCode": "TooManyRequests"}),
-            _Response(payload={"value": [_job(started=NOW)]}),
+            _Response(
+                status_code=503,
+                payload={"message": "fake-relay-secret"},
+                headers={
+                    "Location": (
+                        "https://api.fabric.microsoft.com/v1/workspaces/"
+                        f"{WORKSPACE_ID}/items/{NOTEBOOK_ID}/jobs/instances/{JOB_ID}"
+                    ),
+                    "x-ms-request-id": OTHER_JOB_ID,
+                },
+            ),
+            _Response(payload=_job(notebook_id=OTHER_NOTEBOOK_ID, started=NOW)),
         ],
     )
 
-    job_ref = privysession._trigger_notebook_run(_credentials())
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+        privysession._trigger_notebook_run(credentials)
 
-    assert job_ref.job_instance_id == JOB_ID
-    assert [method for method, _, _ in calls] == ["GET", "POST", "GET", "GET"]
-    assert sum(method == "POST" for method, _, _ in calls) == 1
+    evidence = exc_info.value.evidence
+    assert evidence["server_request_id"] == OTHER_JOB_ID
+    assert evidence["location_job_instance_id"] == JOB_ID
+    assert evidence["location_job_detail"]["root_activity_id"] == JOB_ID
+    assert evidence["location_validation"] == "mismatch"
+    assert "fake-relay-secret" not in str(exc_info.value)
+    assert privysession._read_cached_job_ref(WORKSPACE_ID, NOTEBOOK_ID, target_id) is None
+    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
     _assert_skill_header(calls)
 
 
 @pytest.mark.parametrize("status_code", [408, 500, 502, 503, 504])
-def test_ambiguous_submit_http_statuses_reconcile_without_resubmission(
+def test_ambiguous_submit_http_status_without_location_fails_unattributable(
     monkeypatch,
     status_code,
 ):
+    monkeypatch.setattr(privysession, "_JOB_RECONCILE_TIMEOUT_S", 0)
     calls = _install_requests(
         monkeypatch,
         [
             _Response(payload={"value": []}),
             _Response(status_code=status_code, payload={"errorCode": "TransientFailure"}),
-            _Response(payload={"value": [_job(started=NOW)]}),
         ],
     )
 
-    job_ref = privysession._trigger_notebook_run(_credentials())
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+        privysession._trigger_notebook_run(_credentials())
 
-    assert job_ref.job_instance_id == JOB_ID
-    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
+    assert exc_info.value.evidence["ambiguity_kind"] == f"HTTP {status_code}"
+    assert exc_info.value.evidence["location_job_instance_id"] is None
+    assert [method for method, _, _ in calls] == ["GET", "POST"]
     assert sum(method == "POST" for method, _, _ in calls) == 1
+    _assert_skill_header(calls)
+
+
+def test_stalled_first_reconciliation_page_consumes_only_remaining_budget_and_unlocks(
+    monkeypatch,
+):
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if len(calls) == 1:
+            return _Response(payload={"value": []})
+        if len(calls) == 2:
+            raise requests.Timeout("ambiguous submit")
+        assert method == "GET"
+        assert kwargs["timeout"] == pytest.approx(30)
+        clock.advance(kwargs["timeout"])
+        raise requests.Timeout("stalled history page")
+
+    monkeypatch.setattr(privysession.requests, "request", request)
+    monkeypatch.setattr(
+        privysession,
+        "get_headers",
+        lambda credentials: {"Authorization": "******"},
+    )
+    credentials = _credentials()
+
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
+        privysession._trigger_notebook_run(credentials)
+
+    assert exc_info.value.evidence["last_history_error"] == "Timeout"
+    assert exc_info.value.evidence["elapsed_seconds"] == pytest.approx(30)
+    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
+    _assert_skill_header(calls)
+    target_id = privysession._job_target_id(credentials)
+    with privysession._notebook_scope_lock(WORKSPACE_ID, NOTEBOOK_ID):
+        with privysession._notebook_job_lock(WORKSPACE_ID, NOTEBOOK_ID, target_id):
+            pass
+
+
+def test_slow_history_pagination_caps_each_page_by_remaining_budget(monkeypatch):
+    clock = _Clock()
+    _use_clock(monkeypatch, clock)
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        if len(calls) == 1:
+            assert kwargs["timeout"] == pytest.approx(30)
+            clock.advance(20)
+            return _Response(
+                payload={
+                    "value": [],
+                    "continuationToken": "next-page",
+                }
+            )
+        assert kwargs["timeout"] == pytest.approx(10)
+        clock.advance(11)
+        return _Response(payload={"value": []})
+
+    monkeypatch.setattr(privysession.requests, "request", request)
+    monkeypatch.setattr(
+        privysession,
+        "get_headers",
+        lambda credentials: {"Authorization": "******"},
+    )
+
+    with pytest.raises(DbtRuntimeError, match="expired after a page"):
+        privysession._list_item_job_instances(
+            _credentials(),
+            WORKSPACE_ID,
+            NOTEBOOK_ID,
+            timeout_s=30,
+        )
+
+    assert [call[2]["timeout"] for call in calls] == pytest.approx([30, 10])
+    assert calls[1][2]["params"] == {"continuationToken": "next-page"}
     _assert_skill_header(calls)
 
 
@@ -575,16 +751,16 @@ def test_unreconciled_post_fails_without_chaining_secret_bearing_request(monkeyp
         [
             _Response(payload={"value": []}),
             requests.Timeout("fake-relay-secret"),
-            _Response(payload={"value": []}),
         ],
     )
 
-    with pytest.raises(DbtRuntimeError) as exc_info:
+    with pytest.raises(privysession.PrivyNotebookSubmissionAmbiguousError) as exc_info:
         privysession._trigger_notebook_run(_credentials())
 
     assert exc_info.value.__context__ is None
     assert "fake-relay-secret" not in str(exc_info.value)
-    assert [method for method, _, _ in calls] == ["GET", "POST", "GET"]
+    assert exc_info.value.evidence["observed_new_jobs"] == []
+    assert [method for method, _, _ in calls] == ["GET", "POST"]
     assert sum(method == "POST" for method, _, _ in calls) == 1
     _assert_skill_header(calls)
 

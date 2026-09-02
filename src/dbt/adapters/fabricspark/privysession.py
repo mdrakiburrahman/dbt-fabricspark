@@ -129,6 +129,16 @@ class PrivyTransportRetryError(DbtDatabaseError):
     pass
 
 
+class PrivyNotebookSubmissionAmbiguousError(DbtRuntimeError):
+    def __init__(self, evidence: Dict[str, Any]) -> None:
+        self.evidence = evidence
+        super().__init__(
+            "Fabric notebook submission remained unattributable; POST was not retried "
+            "and no job was adopted or cancelled. "
+            f"ambiguity_evidence={json.dumps(evidence, sort_keys=True)}"
+        )
+
+
 def _import_relay_client() -> Any:
     try:
         from privy import RelayClient
@@ -213,10 +223,16 @@ def _job_scheduler_request(
     *,
     json_body: Optional[Dict[str, Any]] = None,
     params: Optional[Dict[str, str]] = None,
+    timeout_s: Optional[float] = None,
 ) -> requests.Response:
+    request_timeout = float(credentials.http_timeout)
+    if timeout_s is not None:
+        if timeout_s <= 0:
+            raise DbtRuntimeError("Fabric Job Scheduler request budget is exhausted.")
+        request_timeout = min(request_timeout, timeout_s)
     kwargs: Dict[str, Any] = {
         "headers": _job_scheduler_headers(credentials),
-        "timeout": credentials.http_timeout,
+        "timeout": request_timeout,
     }
     if json_body is not None:
         kwargs["json"] = json_body
@@ -292,16 +308,31 @@ def _list_item_job_instances(
     credentials: FabricSparkCredentials,
     workspace_id: str,
     notebook_id: str,
+    *,
+    timeout_s: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     url = f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}/jobs/instances"
     jobs: List[Dict[str, Any]] = []
     continuation_token: Optional[str] = None
     seen_tokens = set()
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     for _ in range(_JOB_HISTORY_MAX_PAGES):
+        remaining = _remaining_budget(deadline)
+        if remaining is not None and remaining <= 0:
+            raise DbtRuntimeError("Fabric Job Scheduler history budget is exhausted.")
         params = (
             {"continuationToken": continuation_token} if continuation_token is not None else None
         )
-        response = _job_scheduler_request("GET", url, credentials, params=params)
+        response = _job_scheduler_request(
+            "GET",
+            url,
+            credentials,
+            params=params,
+            timeout_s=remaining,
+        )
+        remaining = _remaining_budget(deadline)
+        if remaining is not None and remaining <= 0:
+            raise DbtRuntimeError("Fabric Job Scheduler history budget expired after a page.")
         _require_job_response("history lookup", response, (200,))
         try:
             payload = response.json()
@@ -327,6 +358,12 @@ def _list_item_job_instances(
             )
         seen_tokens.add(continuation_token)
     raise DbtRuntimeError(f"Fabric Job Scheduler history exceeded {_JOB_HISTORY_MAX_PAGES} pages.")
+
+
+def _remaining_budget(deadline: Optional[float]) -> Optional[float]:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
 
 
 def _job_started_at(job: Dict[str, Any]) -> Optional[dt.datetime]:
@@ -482,15 +519,32 @@ def _job_instance_id_from_response(response: requests.Response) -> Optional[str]
             and _UUID_RE.fullmatch(path_parts[-1])
         ):
             return path_parts[-1]
-    try:
-        payload = response.json()
-    except (ValueError, TypeError):
-        return None
-    if isinstance(payload, dict):
-        job_instance_id = payload.get("id")
-        if isinstance(job_instance_id, str) and _UUID_RE.fullmatch(job_instance_id):
-            return job_instance_id
     return None
+
+
+def _response_request_id(response: Optional[requests.Response]) -> Optional[str]:
+    if response is None:
+        return None
+    for name, value in response.headers.items():
+        if name.casefold() in {"x-ms-request-id", "request-id"}:
+            return _safe_uuid(value)
+    return None
+
+
+def _safe_uuid(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or _UUID_RE.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _job_ambiguity_evidence(job: Dict[str, Any]) -> Dict[str, Any]:
+    started_at = _job_started_at(job)
+    return {
+        "job_instance_id": _safe_uuid(job.get("id")),
+        "root_activity_id": _safe_uuid(job.get("rootActivityId")),
+        "status": _safe_diagnostic_code(job.get("status")),
+        "start_time_utc": started_at.isoformat() if started_at is not None else None,
+    }
 
 
 def _request_exception_label(exc: BaseException) -> str:
@@ -578,6 +632,9 @@ def _trigger_notebook_run_locked(
         )
     except requests.exceptions.RequestException as exc:
         ambiguous_error = _request_exception_label(exc)
+        exception_response = getattr(exc, "response", None)
+        if isinstance(exception_response, requests.Response):
+            response = exception_response
 
     if ambiguous_error is not None:
         logger.warning(
@@ -592,6 +649,8 @@ def _trigger_notebook_run_locked(
             correlation_token,
             submission_started_at,
             prior_job_ids,
+            ambiguity_kind=ambiguous_error,
+            response=response,
         )
 
     if response is None:  # pragma: no cover - defensive
@@ -609,6 +668,8 @@ def _trigger_notebook_run_locked(
             correlation_token,
             submission_started_at,
             prior_job_ids,
+            ambiguity_kind=f"HTTP {response.status_code}",
+            response=response,
         )
     _require_job_response(
         "parameterized notebook submission", response, (200, 202), parameter_submission=True
@@ -627,6 +688,8 @@ def _trigger_notebook_run_locked(
             correlation_token,
             submission_started_at,
             prior_job_ids,
+            ambiguity_kind="accepted_without_job_id",
+            response=response,
         )
 
     job_ref = _NotebookJobRef(
@@ -699,12 +762,58 @@ def _reconcile_ambiguous_notebook_submission(
     correlation_token: str,
     submission_started_at: dt.datetime,
     prior_job_ids: Sequence[str],
+    *,
+    ambiguity_kind: str,
+    response: Optional[requests.Response],
 ) -> _NotebookJobRef:
-    deadline = time.monotonic() + _JOB_RECONCILE_TIMEOUT_S
+    # Fabric documents Location as the POST-to-job link. Job history's
+    # rootActivityId is server-generated but is not documented as matching any
+    # POST response/request header, so timing-only history entries are evidence,
+    # never attribution.
+    started_tick = time.monotonic()
+    deadline = started_tick + _JOB_RECONCILE_TIMEOUT_S
+    location_job_instance_id = (
+        _job_instance_id_from_response(response) if response is not None else None
+    )
+    evidence: Dict[str, Any] = {
+        "schema_version": 1,
+        "ambiguity_kind": ambiguity_kind,
+        "workspace_id": workspace_id,
+        "notebook_id": notebook_id,
+        "target_id": target_id,
+        "campaign_correlation_token": correlation_token,
+        "submission_started_at": submission_started_at.isoformat(),
+        "budget_seconds": _JOB_RECONCILE_TIMEOUT_S,
+        "server_request_id": _response_request_id(response),
+        "location_job_instance_id": location_job_instance_id,
+        "post_retried": False,
+        "cancel_attempted": False,
+    }
+    if location_job_instance_id is not None:
+        return _reconcile_location_job_instance(
+            credentials,
+            workspace_id,
+            notebook_id,
+            target_id,
+            correlation_token,
+            location_job_instance_id,
+            deadline,
+            evidence,
+        )
+
     last_error: Optional[str] = None
+    observed_jobs: Dict[str, Dict[str, Any]] = {}
     while True:
+        remaining = _remaining_budget(deadline)
+        if remaining is None or remaining <= 0:
+            break
         try:
-            history = _list_item_job_instances(credentials, workspace_id, notebook_id)
+            history = _list_item_job_instances(
+                credentials,
+                workspace_id,
+                notebook_id,
+                timeout_s=remaining,
+            )
         except (requests.exceptions.RequestException, DbtRuntimeError) as exc:
             last_error = _request_exception_label(exc)
         else:
@@ -715,46 +824,103 @@ def _reconcile_ambiguous_notebook_submission(
                 not_after=_utc_now() + _JOB_SUBMISSION_CLOCK_SKEW,
                 excluded_job_ids=prior_job_ids,
             )
-            if len(matches) > 1:
-                raise DbtRuntimeError(
-                    "Fabric notebook submission reconciliation found multiple plausible "
-                    "jobs for the notebook and singleton submission bounds."
-                )
-            if len(matches) == 1:
-                job_ref = _job_ref_from_instance(
-                    matches[0],
-                    workspace_id=workspace_id,
-                    notebook_id=notebook_id,
-                    target_id=target_id,
-                    correlation_token=correlation_token,
-                )
-                _cache_job_ref(job_ref)
-                logger.info(
-                    "Reconciled the ambiguous Fabric notebook submission to job "
-                    f"{job_ref.job_instance_id}."
-                )
-                return job_ref
+            for job in matches:
+                job_id = _safe_uuid(job.get("id"))
+                if job_id is not None:
+                    observed_jobs[job_id] = _job_ambiguity_evidence(job)
             last_error = None
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            detail = f" Last history error: {last_error}." if last_error else ""
-            raise DbtRuntimeError(
-                "Could not reconcile the ambiguous Fabric notebook submission within "
-                "the bounded history window; POST was not retried." + detail
+        remaining = _remaining_budget(deadline)
+        if remaining is None or remaining <= 0:
+            break
+        time.sleep(min(_JOB_RECONCILE_POLL_S, remaining))
+
+    evidence["elapsed_seconds"] = max(0.0, time.monotonic() - started_tick)
+    evidence["last_history_error"] = last_error
+    evidence["observed_new_jobs"] = list(observed_jobs.values())
+    raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
+
+
+def _reconcile_location_job_instance(
+    credentials: FabricSparkCredentials,
+    workspace_id: str,
+    notebook_id: str,
+    target_id: str,
+    correlation_token: str,
+    job_instance_id: str,
+    deadline: float,
+    evidence: Dict[str, Any],
+) -> _NotebookJobRef:
+    last_error: Optional[str] = None
+    while True:
+        remaining = _remaining_budget(deadline)
+        if remaining is None or remaining <= 0:
+            evidence["last_detail_error"] = last_error
+            evidence["elapsed_seconds"] = _JOB_RECONCILE_TIMEOUT_S
+            raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
+        try:
+            job = _get_job_instance_status(
+                credentials,
+                workspace_id,
+                notebook_id,
+                job_instance_id,
+                timeout_s=remaining,
             )
+        except (requests.exceptions.RequestException, DbtRuntimeError) as exc:
+            last_error = _request_exception_label(exc)
+        else:
+            detail_evidence = _job_ambiguity_evidence(job)
+            evidence["location_job_detail"] = detail_evidence
+            remaining_after_detail = _remaining_budget(deadline)
+            if remaining_after_detail is None or remaining_after_detail <= 0:
+                evidence["location_validation"] = "detail_arrived_after_deadline"
+                evidence["elapsed_seconds"] = _JOB_RECONCILE_TIMEOUT_S
+                raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
+            if (
+                job.get("id") != job_instance_id
+                or job.get("itemId") != notebook_id
+                or job.get("jobType") != "RunNotebook"
+            ):
+                evidence["location_validation"] = "mismatch"
+                evidence["elapsed_seconds"] = max(
+                    0.0,
+                    _JOB_RECONCILE_TIMEOUT_S - (_remaining_budget(deadline) or 0.0),
+                )
+                raise PrivyNotebookSubmissionAmbiguousError(evidence) from None
+            job_ref = _job_ref_from_instance(
+                job,
+                workspace_id=workspace_id,
+                notebook_id=notebook_id,
+                target_id=target_id,
+                correlation_token=correlation_token,
+            )
+            _cache_job_ref(job_ref)
+            logger.info(
+                "Reconciled the ambiguous Fabric notebook submission through its "
+                f"server-returned Location job ID {job_ref.job_instance_id}."
+            )
+            return job_ref
+
+        remaining = _remaining_budget(deadline)
+        if remaining is None or remaining <= 0:
+            continue
         time.sleep(min(_JOB_RECONCILE_POLL_S, remaining))
 
 
 def _get_job_instance_status(
-    credentials: FabricSparkCredentials, workspace_id: str, item_id: str, job_instance_id: str
+    credentials: FabricSparkCredentials,
+    workspace_id: str,
+    item_id: str,
+    job_instance_id: str,
+    *,
+    timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """GET .../items/{itemId}/jobs/instances/{jobInstanceId} — the run's live status."""
     url = (
         f"{credentials.endpoint}/workspaces/{workspace_id}/items/{item_id}"
         f"/jobs/instances/{job_instance_id}"
     )
-    response = _job_scheduler_request("GET", url, credentials)
+    response = _job_scheduler_request("GET", url, credentials, timeout_s=timeout_s)
     _require_job_response("status poll", response, (200,))
     try:
         payload = response.json()
