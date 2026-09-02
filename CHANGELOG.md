@@ -3,6 +3,17 @@
 ## v1.13.1
 
 - POC hack, do NOT merge
+- Privy notebook auto-start now submits the complete typed Fabric Notebook
+  parameter set from the existing Relay credentials plus configurable
+  `privy_max_workers`, `privy_serialize_inprocess`, and the nonsecret
+  `privy_campaign_correlation_token`. It checks the latest five minutes of
+  paginated job history before submitting, reuses exactly one correlated
+  active run, rejects ambiguous matches, caches accepted job IDs immediately,
+  and reconciles ambiguous POST outcomes without retrying the POST. Parameter
+  rejection fails closed with no empty-body fallback. Every Job Scheduler
+  history, submit, pagination, and status request carries
+  `x-ms-fabric-skill: spark-cli`, and request bodies plus Relay credential
+  values are excluded from logs, exceptions, and credential representations.
 - Fixed Privy listener reconnects and Relay 404/504 responses causing dbt to resubmit
   already-running SQL. Submit retries now reuse one protocol request id and therefore
   one server job, while notebook-interpreter deduplication remains as a fallback for

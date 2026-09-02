@@ -41,7 +41,9 @@ import re
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from dbt_common.exceptions import DbtDatabaseError, DbtRuntimeError
@@ -75,6 +77,14 @@ _UNBOUNDED_TIMEOUT_S = 7 * 24 * 3600.0
 # https://learn.microsoft.com/en-us/rest/api/fabric/core/job-scheduler/get-item-job-instance
 _JOB_TERMINAL_STATUSES = {"Completed", "Failed", "Cancelled", "Deduped"}
 _JOB_FAILURE_STATUSES = {"Failed", "Cancelled"}
+_JOB_ACTIVE_STATUSES = {"NotStarted", "InProgress", "Queued", "Running"}
+_JOB_RECENT_WINDOW = dt.timedelta(minutes=5)
+_JOB_SUBMISSION_CLOCK_SKEW = dt.timedelta(seconds=30)
+_JOB_HISTORY_MAX_PAGES = 20
+_JOB_RECONCILE_TIMEOUT_S = 30.0
+_JOB_RECONCILE_POLL_S = 1.0
+_FABRIC_SKILL_HEADER = "x-ms-fabric-skill"
+_FABRIC_SKILL_VALUE = "spark-cli"
 _PRIVY_EXECUTION_SPAN_PREFIX = "PRIVY_EXECUTION_SPAN "
 _PRIVY_TIMING_NEGATIVE_CLAMP_MS = 5
 _PRIVY_TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
@@ -96,6 +106,14 @@ _PRIVY_STATUS_PROBE_WAIT_S = 0.0
 # a transient relay error) — signals ``_control_call`` to fall back to its
 # normal sleep-then-retry loop.
 _PROBE_INCONCLUSIVE = object()
+
+
+@dataclass(frozen=True)
+class _NotebookJobRef:
+    workspace_id: str
+    notebook_id: str
+    job_instance_id: str
+    correlation_token: str
 
 
 class PrivyTransportRetryError(DbtDatabaseError):
@@ -169,62 +187,506 @@ def _parse_notebook_ids(notebook_url: Optional[str]) -> Tuple[str, str]:
     return ids[0], ids[1]
 
 
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _job_scheduler_headers(credentials: FabricSparkCredentials) -> Dict[str, str]:
+    headers = dict(get_headers(credentials))
+    headers[_FABRIC_SKILL_HEADER] = _FABRIC_SKILL_VALUE
+    return headers
+
+
+def _job_scheduler_request(
+    method: str,
+    url: str,
+    credentials: FabricSparkCredentials,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, str]] = None,
+) -> requests.Response:
+    kwargs: Dict[str, Any] = {
+        "headers": _job_scheduler_headers(credentials),
+        "timeout": credentials.http_timeout,
+    }
+    if json_body is not None:
+        kwargs["json"] = json_body
+    if params is not None:
+        kwargs["params"] = params
+    return requests.request(method, url, **kwargs)
+
+
+def _response_error_code(response: requests.Response) -> Optional[str]:
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error_code = payload.get("errorCode")
+    if not error_code and isinstance(payload.get("error"), dict):
+        error_code = payload["error"].get("errorCode")
+    return _safe_diagnostic_code(error_code)
+
+
+def _safe_diagnostic_code(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value):
+        return None
+    return value
+
+
+def _raise_job_response_error(
+    operation: str,
+    response: requests.Response,
+    *,
+    parameter_submission: bool = False,
+) -> None:
+    error_code = _response_error_code(response)
+    detail = f"HTTP {response.status_code}"
+    if error_code:
+        detail += f", errorCode={error_code}"
+    if parameter_submission:
+        raise DbtRuntimeError(
+            f"Fabric rejected the parameterized notebook submission ({detail}); "
+            "the adapter failed closed and a parameterless fallback was not attempted."
+        )
+    raise DbtRuntimeError(f"Fabric Job Scheduler {operation} failed ({detail}).")
+
+
+def _require_job_response(
+    operation: str,
+    response: requests.Response,
+    expected_statuses: Sequence[int],
+    *,
+    parameter_submission: bool = False,
+) -> None:
+    if response.status_code not in expected_statuses:
+        _raise_job_response_error(
+            operation,
+            response,
+            parameter_submission=parameter_submission,
+        )
+
+
+def _continuation_token(payload: Dict[str, Any]) -> Optional[str]:
+    token = payload.get("continuationToken")
+    if isinstance(token, str) and token:
+        return token
+    continuation_uri = payload.get("continuationUri")
+    if not isinstance(continuation_uri, str) or not continuation_uri:
+        return None
+    values = parse_qs(urlparse(continuation_uri).query).get("continuationToken")
+    return values[0] if values else None
+
+
+def _list_item_job_instances(
+    credentials: FabricSparkCredentials,
+    workspace_id: str,
+    notebook_id: str,
+) -> List[Dict[str, Any]]:
+    url = f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}/jobs/instances"
+    jobs: List[Dict[str, Any]] = []
+    continuation_token: Optional[str] = None
+    seen_tokens = set()
+    for _ in range(_JOB_HISTORY_MAX_PAGES):
+        params = (
+            {"continuationToken": continuation_token} if continuation_token is not None else None
+        )
+        response = _job_scheduler_request("GET", url, credentials, params=params)
+        _require_job_response("history lookup", response, (200,))
+        try:
+            payload = response.json()
+        except (ValueError, TypeError) as exc:
+            raise DbtRuntimeError(
+                "Fabric Job Scheduler history lookup returned invalid JSON."
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or "value" not in payload
+            or not isinstance(payload["value"], list)
+        ):
+            raise DbtRuntimeError(
+                "Fabric Job Scheduler history lookup returned an invalid result shape."
+            )
+        jobs.extend(job for job in payload.get("value", []) if isinstance(job, dict))
+        continuation_token = _continuation_token(payload)
+        if continuation_token is None:
+            return jobs
+        if continuation_token in seen_tokens:
+            raise DbtRuntimeError(
+                "Fabric Job Scheduler history pagination repeated a continuation token."
+            )
+        seen_tokens.add(continuation_token)
+    raise DbtRuntimeError(f"Fabric Job Scheduler history exceeded {_JOB_HISTORY_MAX_PAGES} pages.")
+
+
+def _parameter_value(parameters: Any, name: str) -> Any:
+    if isinstance(parameters, list):
+        for entry in parameters:
+            if not isinstance(entry, dict):
+                continue
+            entry_name = entry.get("name")
+            if isinstance(entry_name, str) and entry_name.casefold() == name.casefold():
+                return entry.get("value")
+        return None
+    if isinstance(parameters, dict):
+        for entry_name, entry in parameters.items():
+            if str(entry_name).casefold() != name.casefold():
+                continue
+            if isinstance(entry, dict) and "value" in entry:
+                return entry["value"]
+            return entry
+    return None
+
+
+def _job_correlation_token(job: Dict[str, Any]) -> Optional[str]:
+    parameter_sets = [job.get("parameters")]
+    execution_data = job.get("executionData")
+    if isinstance(execution_data, dict):
+        parameter_sets.append(execution_data.get("parameters"))
+    for parameters in parameter_sets:
+        value = _parameter_value(parameters, "campaign_correlation_token")
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _job_started_at(job: Dict[str, Any]) -> Optional[dt.datetime]:
+    value = job.get("startTimeUtc")
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = _parse_utc_iso(value)
+    except ValueError:
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _matching_job_refs(
+    jobs: Sequence[Dict[str, Any]],
+    *,
+    workspace_id: str,
+    notebook_id: str,
+    correlation_token: str,
+    not_before: dt.datetime,
+    not_after: dt.datetime,
+    statuses: Optional[Sequence[str]] = None,
+    cached_ref: Optional[_NotebookJobRef] = None,
+    allow_tokenless: bool = False,
+    excluded_job_ids: Optional[Sequence[str]] = None,
+) -> List[_NotebookJobRef]:
+    allowed_statuses = set(statuses) if statuses is not None else None
+    excluded_ids = set(excluded_job_ids or ())
+    matches: Dict[str, _NotebookJobRef] = {}
+    for job in jobs:
+        if job.get("itemId") not in (None, notebook_id):
+            continue
+        if job.get("jobType") not in (None, "RunNotebook"):
+            continue
+        if allowed_statuses is not None and job.get("status") not in allowed_statuses:
+            continue
+        started_at = _job_started_at(job)
+        if started_at is None or started_at < not_before or started_at > not_after:
+            continue
+        job_instance_id = job.get("id")
+        if not isinstance(job_instance_id, str) or _UUID_RE.fullmatch(job_instance_id) is None:
+            continue
+        if job_instance_id in excluded_ids:
+            continue
+        observed_token = _job_correlation_token(job)
+        token_matches = observed_token == correlation_token
+        cache_matches = (
+            cached_ref is not None
+            and cached_ref.workspace_id == workspace_id
+            and cached_ref.notebook_id == notebook_id
+            and cached_ref.job_instance_id == job_instance_id
+            and cached_ref.correlation_token == correlation_token
+        )
+        tokenless_matches = allow_tokenless and observed_token is None
+        if not token_matches and not cache_matches and not tokenless_matches:
+            continue
+        matches[job_instance_id] = _NotebookJobRef(
+            workspace_id=workspace_id,
+            notebook_id=notebook_id,
+            job_instance_id=job_instance_id,
+            correlation_token=correlation_token,
+        )
+    return list(matches.values())
+
+
+def _resolve_job_correlation_token(
+    credentials: FabricSparkCredentials,
+    workspace_id: str,
+    notebook_id: str,
+) -> str:
+    if credentials.privy_campaign_correlation_token:
+        return credentials.privy_campaign_correlation_token
+    target = ":".join(
+        (
+            workspace_id,
+            notebook_id,
+            credentials.privy_relay_namespace or "",
+            credentials.privy_relay_path or "",
+        )
+    )
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:24]
+    return f"dbt-fabricspark-{digest}"
+
+
+def _notebook_run_body(
+    credentials: FabricSparkCredentials,
+    *,
+    correlation_token: str,
+) -> Dict[str, Any]:
+    return {
+        "parameters": [
+            {
+                "name": "relay_namespace",
+                "value": credentials.privy_relay_namespace,
+                "type": "Text",
+            },
+            {
+                "name": "relay_path",
+                "value": credentials.privy_relay_path,
+                "type": "Text",
+            },
+            {
+                "name": "relay_key_rule",
+                "value": credentials.privy_relay_keyrule,
+                "type": "Text",
+            },
+            {
+                "name": "relay_key",
+                "value": credentials.privy_relay_key,
+                "type": "Text",
+            },
+            {
+                "name": "max_workers",
+                "value": credentials.privy_max_workers,
+                "type": "Integer",
+            },
+            {
+                "name": "serialize_inprocess",
+                "value": credentials.privy_serialize_inprocess,
+                "type": "Boolean",
+            },
+            {
+                "name": "campaign_correlation_token",
+                "value": correlation_token,
+                "type": "Text",
+            },
+        ]
+    }
+
+
+def _job_instance_id_from_response(response: requests.Response) -> Optional[str]:
+    location = response.headers.get("Location", "")
+    if isinstance(location, str):
+        path_parts = [part for part in urlparse(location).path.split("/") if part]
+        if (
+            len(path_parts) >= 3
+            and path_parts[-3:-1] == ["jobs", "instances"]
+            and _UUID_RE.fullmatch(path_parts[-1])
+        ):
+            return path_parts[-1]
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return None
+    if isinstance(payload, dict):
+        job_instance_id = payload.get("id")
+        if isinstance(job_instance_id, str) and _UUID_RE.fullmatch(job_instance_id):
+            return job_instance_id
+    return None
+
+
+def _request_exception_label(exc: BaseException) -> str:
+    return type(exc).__name__
+
+
 def _trigger_notebook_run(
     credentials: FabricSparkCredentials,
-) -> Optional[Tuple[str, str, str]]:
-    """Best-effort trigger of the Fabric notebook via the Job Scheduler API.
-
-    POST .../items/{notebookId}/jobs/instances?jobType=RunNotebook — a 202
-    means the run was accepted (the notebook, and eventually its
-    ``RelayServer.serve_forever()`` cell, will start). This never polls the
-    job to completion here: the job is meant to run forever, so acceptance is
-    the only thing checked at trigger time. The job instance id (parsed from
-    the ``Location`` header) is returned so the caller can poll its status
-    while waiting for the relay — see ``_wait_for_relay``. Failures to trigger
-    are logged and swallowed rather than raised — the notebook might already
-    be starting (e.g. from a previous invocation or a manual start), so the
-    wait loop is the real arbiter.
-    """
+) -> _NotebookJobRef:
+    """Reuse one recent correlated run or submit one parameterized notebook job."""
     try:
         workspace_id, notebook_id = _parse_notebook_ids(credentials.privy_notebook_url)
     except ValueError as exc:
-        logger.warning(
-            f"Could not parse workspace/notebook id from privy_notebook_url ({exc}). "
-            f"Skipping auto-start; will still wait in case the relay is already up."
+        raise DbtRuntimeError(
+            "Could not parse workspace/notebook IDs from privy_notebook_url; "
+            "refusing to auto-start without an exact Job Scheduler target."
+        ) from exc
+
+    correlation_token = _resolve_job_correlation_token(
+        credentials,
+        workspace_id,
+        notebook_id,
+    )
+    cached_ref = _read_cached_job_ref(workspace_id, notebook_id, correlation_token)
+    recent_not_before = _utc_now() - _JOB_RECENT_WINDOW
+    recent_not_after = _utc_now() + _JOB_SUBMISSION_CLOCK_SKEW
+    try:
+        history = _list_item_job_instances(credentials, workspace_id, notebook_id)
+    except requests.exceptions.RequestException as exc:
+        raise DbtRuntimeError(
+            "Could not inspect recent Fabric notebook job history "
+            f"({_request_exception_label(exc)}); refusing to submit without duplicate checks."
+        ) from None
+    active_matches = _matching_job_refs(
+        history,
+        workspace_id=workspace_id,
+        notebook_id=notebook_id,
+        correlation_token=correlation_token,
+        not_before=recent_not_before,
+        not_after=recent_not_after,
+        statuses=tuple(_JOB_ACTIVE_STATUSES),
+        cached_ref=cached_ref,
+    )
+    plausible_active_matches = _matching_job_refs(
+        history,
+        workspace_id=workspace_id,
+        notebook_id=notebook_id,
+        correlation_token=correlation_token,
+        not_before=recent_not_before,
+        not_after=recent_not_after,
+        statuses=tuple(_JOB_ACTIVE_STATUSES),
+        cached_ref=cached_ref,
+        allow_tokenless=True,
+    )
+    if len(plausible_active_matches) > 1:
+        raise DbtRuntimeError(
+            "Fabric notebook auto-start found multiple active jobs for the notebook "
+            "and campaign correlation token; refusing an ambiguous reuse or submission."
         )
-        return None
+    if len(active_matches) == 1:
+        job_ref = active_matches[0]
+        _cache_job_ref(job_ref)
+        logger.info(f"Reusing recent active Fabric notebook job {job_ref.job_instance_id}.")
+        return job_ref
 
     url = (
         f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}"
         f"/jobs/instances?jobType=RunNotebook"
     )
     logger.info(f"Privy relay not responding; triggering Fabric notebook run: POST {url}")
+    body = _notebook_run_body(credentials, correlation_token=correlation_token)
+    prior_job_ids = {str(job["id"]) for job in history if isinstance(job.get("id"), str)}
+    submission_started_at = _utc_now()
+    response: Optional[requests.Response] = None
+    ambiguous_error: Optional[str] = None
     try:
-        headers = get_headers(credentials)
-        response = requests.post(url, headers=headers, json={}, timeout=credentials.http_timeout)
-        if response.status_code in (200, 202):
-            location = response.headers.get("Location", "")
-            job_instance_id = location.rstrip("/").rsplit("/", 1)[-1] if location else ""
-            logger.info(
-                f"Notebook run triggered (HTTP {response.status_code}). "
-                f"Job instance: {job_instance_id or 'unknown'}. "
-                f"Waiting for the Privy relay to come up..."
-            )
-            if job_instance_id:
-                return workspace_id, notebook_id, job_instance_id
-            return None
-        else:
-            logger.warning(
-                f"Notebook run trigger returned HTTP {response.status_code}: "
-                f"{response.text[:500]}. Will keep waiting in case it's already starting "
-                f"(e.g. started manually, or by a previous dbt invocation)."
-            )
-    except requests.exceptions.RequestException as exc:
-        logger.warning(
-            f"Failed to trigger notebook run ({exc}). Will keep waiting in case it's "
-            f"already starting."
+        response = _job_scheduler_request(
+            "POST",
+            url,
+            credentials,
+            json_body=body,
         )
-    return None
+    except requests.exceptions.RequestException as exc:
+        ambiguous_error = _request_exception_label(exc)
+
+    if ambiguous_error is not None:
+        logger.warning(
+            "Fabric notebook submission outcome is ambiguous "
+            f"({ambiguous_error}); reconciling through job history without retrying POST."
+        )
+        return _reconcile_ambiguous_notebook_submission(
+            credentials,
+            workspace_id,
+            notebook_id,
+            correlation_token,
+            submission_started_at,
+            prior_job_ids,
+        )
+
+    if response is None:  # pragma: no cover - defensive
+        raise DbtRuntimeError("Fabric notebook submission produced no response.")
+    _require_job_response(
+        "parameterized notebook submission",
+        response,
+        (200, 202),
+        parameter_submission=True,
+    )
+    job_instance_id = _job_instance_id_from_response(response)
+    if job_instance_id is None:
+        logger.warning(
+            "Fabric accepted the parameterized notebook submission without a usable "
+            "job ID; reconciling through job history without retrying POST."
+        )
+        return _reconcile_ambiguous_notebook_submission(
+            credentials,
+            workspace_id,
+            notebook_id,
+            correlation_token,
+            submission_started_at,
+            prior_job_ids,
+        )
+
+    job_ref = _NotebookJobRef(
+        workspace_id=workspace_id,
+        notebook_id=notebook_id,
+        job_instance_id=job_instance_id,
+        correlation_token=correlation_token,
+    )
+    _cache_job_ref(job_ref)
+    logger.info(
+        f"Notebook run triggered (HTTP {response.status_code}). "
+        f"Job instance: {job_instance_id}. Waiting for the Privy relay to come up..."
+    )
+    return job_ref
+
+
+def _reconcile_ambiguous_notebook_submission(
+    credentials: FabricSparkCredentials,
+    workspace_id: str,
+    notebook_id: str,
+    correlation_token: str,
+    submission_started_at: dt.datetime,
+    prior_job_ids: Sequence[str],
+) -> _NotebookJobRef:
+    deadline = time.monotonic() + _JOB_RECONCILE_TIMEOUT_S
+    last_error: Optional[str] = None
+    while True:
+        try:
+            history = _list_item_job_instances(credentials, workspace_id, notebook_id)
+        except (requests.exceptions.RequestException, DbtRuntimeError) as exc:
+            last_error = _request_exception_label(exc)
+        else:
+            matches = _matching_job_refs(
+                history,
+                workspace_id=workspace_id,
+                notebook_id=notebook_id,
+                correlation_token=correlation_token,
+                not_before=submission_started_at - _JOB_SUBMISSION_CLOCK_SKEW,
+                not_after=_utc_now() + _JOB_SUBMISSION_CLOCK_SKEW,
+                allow_tokenless=True,
+                excluded_job_ids=prior_job_ids,
+            )
+            if len(matches) > 1:
+                raise DbtRuntimeError(
+                    "Fabric notebook submission reconciliation found multiple plausible "
+                    "jobs for the notebook, campaign token, and submission bounds."
+                )
+            if len(matches) == 1:
+                job_ref = matches[0]
+                _cache_job_ref(job_ref)
+                logger.info(
+                    "Reconciled the ambiguous Fabric notebook submission to job "
+                    f"{job_ref.job_instance_id}."
+                )
+                return job_ref
+            last_error = None
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            detail = f" Last history error: {last_error}." if last_error else ""
+            raise DbtRuntimeError(
+                "Could not reconcile the ambiguous Fabric notebook submission within "
+                "the bounded history window; POST was not retried." + detail
+            )
+        time.sleep(min(_JOB_RECONCILE_POLL_S, remaining))
 
 
 def _get_job_instance_status(
@@ -235,54 +697,107 @@ def _get_job_instance_status(
         f"{credentials.endpoint}/workspaces/{workspace_id}/items/{item_id}"
         f"/jobs/instances/{job_instance_id}"
     )
-    headers = get_headers(credentials)
-    response = requests.get(url, headers=headers, timeout=credentials.http_timeout)
-    response.raise_for_status()
-    return response.json()
+    response = _job_scheduler_request("GET", url, credentials)
+    _require_job_response("status poll", response, (200,))
+    try:
+        payload = response.json()
+    except (ValueError, TypeError) as exc:
+        raise DbtRuntimeError("Fabric Job Scheduler status poll returned invalid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise DbtRuntimeError("Fabric Job Scheduler status poll returned an invalid result shape.")
+    return payload
 
 
-# Filesystem cache of the last notebook job this machine triggered — mirrors
-# livysession.py's session-id file, but stores a (workspace, notebook, job
-# instance) triple as JSON instead of a bare Livy session id. Lets a fresh
-# dbt invocation (a brand new process — dbt spawns one per `debug`/`run`/
-# `show` etc.) find and reuse a notebook run a previous invocation already
-# triggered instead of firing (and paying for) a new one every single time.
-# Nothing here ever cancels the run — that's left entirely to the caller.
+# Process and filesystem cache of the last correlated notebook job this machine
+# triggered or reconciled. Only nonsecret IDs and the nonsecret correlation
+# token are persisted; notebook parameter bodies and Relay credentials are not.
 _JOB_CACHE_FILENAME = "privy-notebook-job.json"
+_job_refs_by_target: Dict[Tuple[str, str, str], _NotebookJobRef] = {}
+_job_ref_cache_lock = threading.Lock()
 
 
 def _job_cache_path() -> str:
     return os.path.join(os.getcwd(), _JOB_CACHE_FILENAME)
 
 
-def _read_cached_job_ref() -> Optional[Tuple[str, str, str]]:
-    path = _job_cache_path()
+def _job_ref_cache_key(
+    workspace_id: str,
+    notebook_id: str,
+    correlation_token: str,
+) -> Tuple[str, str, str]:
+    return workspace_id, notebook_id, correlation_token
+
+
+def _read_cached_job_ref(
+    workspace_id: str,
+    notebook_id: str,
+    correlation_token: str,
+) -> Optional[_NotebookJobRef]:
+    key = _job_ref_cache_key(workspace_id, notebook_id, correlation_token)
+    with _job_ref_cache_lock:
+        cached = _job_refs_by_target.get(key)
+    if cached is not None:
+        return cached
     try:
-        with open(path) as f:
+        with open(_job_cache_path()) as f:
             data = json.load(f)
-        return data["workspace_id"], data["notebook_id"], data["job_instance_id"]
-    except Exception as exc:
-        logger.debug(f"No usable Privy job cache at {path}: {exc}")
+        job_ref = _NotebookJobRef(
+            workspace_id=str(data["workspace_id"]),
+            notebook_id=str(data["notebook_id"]),
+            job_instance_id=str(data["job_instance_id"]),
+            correlation_token=str(data["correlation_token"]),
+        )
+        if (
+            job_ref.workspace_id != workspace_id
+            or job_ref.notebook_id != notebook_id
+            or job_ref.correlation_token != correlation_token
+            or _UUID_RE.fullmatch(job_ref.job_instance_id) is None
+        ):
+            return None
+        with _job_ref_cache_lock:
+            _job_refs_by_target[key] = job_ref
+        return job_ref
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        logger.debug(
+            "No usable Privy job cache "
+            f"({_request_exception_label(exc)}); a recent-history check will decide reuse."
+        )
         return None
 
 
-def _write_cached_job_ref(job_ref: Tuple[str, str, str]) -> None:
-    path = _job_cache_path()
+def _write_job_ref_file(job_ref: _NotebookJobRef) -> None:
     try:
-        with open(path, "w") as f:
+        with open(_job_cache_path(), "w") as f:
             json.dump(
                 {
-                    "workspace_id": job_ref[0],
-                    "notebook_id": job_ref[1],
-                    "job_instance_id": job_ref[2],
+                    "workspace_id": job_ref.workspace_id,
+                    "notebook_id": job_ref.notebook_id,
+                    "job_instance_id": job_ref.job_instance_id,
+                    "correlation_token": job_ref.correlation_token,
                 },
                 f,
             )
     except OSError as exc:
-        logger.debug(f"Could not write Privy job cache file {path}: {exc}")
+        logger.debug(
+            "Could not persist the Privy job cache "
+            f"({_request_exception_label(exc)}); the process cache remains active."
+        )
+
+
+def _cache_job_ref(job_ref: _NotebookJobRef) -> None:
+    key = _job_ref_cache_key(
+        job_ref.workspace_id,
+        job_ref.notebook_id,
+        job_ref.correlation_token,
+    )
+    with _job_ref_cache_lock:
+        _job_refs_by_target[key] = job_ref
+    _write_job_ref_file(job_ref)
 
 
 def _clear_cached_job_ref() -> None:
+    with _job_ref_cache_lock:
+        _job_refs_by_target.clear()
     try:
         os.remove(_job_cache_path())
     except OSError:
@@ -294,14 +809,14 @@ def _probe(client: Any) -> bool:
         result = client.run_python("1", mode="inprocess", timeout_s=_PROBE_TIMEOUT_S)
         return bool(result.ok)
     except Exception as exc:  # noqa: BLE001 — any failure just means "not ready yet"
-        logger.debug(f"Privy relay probe failed: {exc}")
+        logger.debug(f"Privy relay probe failed ({_relay_error_label(exc)}).")
         return False
 
 
 def _wait_for_relay(
     probe_client: Any,
     credentials: FabricSparkCredentials,
-    job_ref: Optional[Tuple[str, str, str]] = None,
+    job_ref: Optional[_NotebookJobRef] = None,
 ) -> None:
     deadline = time.time() + credentials.privy_ready_timeout
     attempt = 0
@@ -317,17 +832,32 @@ def _wait_for_relay(
         # (failed/cancelled/completed without ever starting the relay — no
         # amount of extra waiting will help, fail fast instead).
         if job_ref is not None:
-            workspace_id, item_id, job_instance_id = job_ref
+            job_instance_id = job_ref.job_instance_id
             try:
-                job = _get_job_instance_status(credentials, workspace_id, item_id, job_instance_id)
+                job = _get_job_instance_status(
+                    credentials,
+                    job_ref.workspace_id,
+                    job_ref.notebook_id,
+                    job_instance_id,
+                )
+            except (requests.exceptions.RequestException, DbtRuntimeError) as exc:
+                logger.debug(
+                    "Could not fetch notebook job status "
+                    f"({_request_exception_label(exc)}); continuing the bounded readiness wait."
+                )
+            else:
                 status = job.get("status", "Unknown")
                 logger.info(f"Notebook job {job_instance_id} status: {status}")
                 if status in _JOB_FAILURE_STATUSES:
                     failure_reason = job.get("failureReason")
+                    error_code = None
+                    if isinstance(failure_reason, dict):
+                        error_code = _safe_diagnostic_code(failure_reason.get("errorCode"))
+                    error_detail = f" errorCode={error_code}." if error_code else ""
                     _clear_cached_job_ref()
                     raise DbtRuntimeError(
                         f"Fabric notebook run {status} before the Privy relay came up "
-                        f"(job {job_instance_id}). failureReason={failure_reason}. "
+                        f"(job {job_instance_id}).{error_detail} "
                         f"Check the notebook run history in the Fabric portal for details."
                     )
                 if status in _JOB_TERMINAL_STATUSES:
@@ -343,8 +873,6 @@ def _wait_for_relay(
                     )
                     _clear_cached_job_ref()
                     job_ref = None
-            except requests.exceptions.RequestException as exc:
-                logger.debug(f"Could not fetch notebook job status: {exc}")
 
         if time.time() >= deadline:
             raise DbtRuntimeError(
@@ -359,47 +887,24 @@ def _wait_for_relay(
 def _ensure_notebook_ready(exec_client: Any, credentials: FabricSparkCredentials) -> None:
     """Probe the relay and, if needed, reuse-or-trigger a notebook run.
 
-    Before triggering a brand-new run, checks the filesystem job cache (see
-    ``_read_cached_job_ref``) for a still-active job a previous dbt
-    invocation already triggered, and waits on that instead — so back-to-back
-    dbt invocations (``debug``, ``run``, ``show``, ...) share one notebook
-    session rather than each firing (and paying for) their own. Nothing is
-    ever cancelled here or on process exit; cancelling the notebook run is
-    entirely up to the caller.
+    Auto-start first reconciles recent Job Scheduler history by notebook and
+    campaign token, then submits at most once. Nothing is ever cancelled here
+    or on process exit; cancelling the notebook run is entirely up to the
+    caller.
     """
     probe_client = _build_relay_client(credentials, http_timeout_s=_PROBE_HTTP_TIMEOUT_S)
     if _probe(probe_client):
         logger.debug("Privy relay already responding; reusing the existing notebook run.")
         return
 
-    job_ref: Optional[Tuple[str, str, str]] = None
-    cached_ref = _read_cached_job_ref()
-    if cached_ref is not None:
-        try:
-            job = _get_job_instance_status(credentials, *cached_ref)
-            status = job.get("status", "Unknown")
-            if status not in _JOB_TERMINAL_STATUSES:
-                logger.info(f"Reusing cached notebook job {cached_ref[2]} (status={status}).")
-                job_ref = cached_ref
-            else:
-                logger.debug(
-                    f"Cached notebook job {cached_ref[2]} is terminal ({status}); discarding."
-                )
-                _clear_cached_job_ref()
-        except requests.exceptions.RequestException as exc:
-            logger.debug(f"Could not check cached notebook job status ({exc}); discarding cache.")
-            _clear_cached_job_ref()
-
-    if job_ref is None:
-        if credentials.privy_auto_start_notebook:
-            job_ref = _trigger_notebook_run(credentials)
-            if job_ref is not None:
-                _write_cached_job_ref(job_ref)
-        else:
-            logger.info(
-                "Privy relay not responding and privy_auto_start_notebook is False; "
-                "waiting for it to be started manually."
-            )
+    job_ref: Optional[_NotebookJobRef] = None
+    if credentials.privy_auto_start_notebook:
+        job_ref = _trigger_notebook_run(credentials)
+    else:
+        logger.info(
+            "Privy relay not responding and privy_auto_start_notebook is False; "
+            "waiting for it to be started manually."
+        )
 
     _wait_for_relay(probe_client, credentials, job_ref)
 
