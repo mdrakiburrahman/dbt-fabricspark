@@ -75,6 +75,8 @@ jobs:
         run: rm -rf "$TMPDIR"
 
       - name: "📁 Verify no untracked files"
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: npm run fail-on-untracked-files
 
   integration-availability:
