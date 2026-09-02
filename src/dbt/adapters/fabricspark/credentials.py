@@ -149,6 +149,14 @@ class FabricSparkCredentials(Credentials):
     # False to manage the run yourself and have the adapter only act as a
     # Privy client.
     privy_auto_start_notebook: bool = True
+    # Runtime settings passed to a parameterized Fabric listener notebook.
+    # Defaults match Privy's native non-benchmark behavior; high-concurrency
+    # campaigns can opt into a larger worker pool from profiles.yml.
+    privy_max_workers: int = 32
+    privy_serialize_inprocess: bool = False
+    # Nonsecret stable token used to reconcile one campaign's RunNotebook job.
+    # When omitted, the adapter derives a stable target-scoped default.
+    privy_campaign_correlation_token: Optional[str] = None
     # Max seconds to keep pinging the relay for readiness (after an auto-start
     # trigger, or while waiting for a manually-started run) before giving up.
     # Independent of session_start_timeout (which is Livy-session-specific).
@@ -186,9 +194,13 @@ class FabricSparkCredentials(Credentials):
             f"credential_class={self.credential_class!r}, "
             f"credential_kwargs_keys={sorted(map(str, self.credential_kwargs.keys()))!r}, "
             f"workspace_name={self.workspace_name!r}, "
-            f"privy_relay_namespace={self.privy_relay_namespace!r}, "
-            f"privy_relay_path={self.privy_relay_path!r}, "
+            f"privy_relay_namespace='***', "
+            f"privy_relay_path='***', "
+            f"privy_relay_keyrule='***', "
             f"privy_notebook_url={self.privy_notebook_url!r}, "
+            f"privy_max_workers={self.privy_max_workers!r}, "
+            f"privy_serialize_inprocess={self.privy_serialize_inprocess!r}, "
+            f"privy_campaign_correlation_token={self.privy_campaign_correlation_token!r}, "
             f"privy_ready_timeout={self.privy_ready_timeout!r}, "
             f"privy_pool_priority_map={self.privy_pool_priority_map!r}, "
             f"privy_relay_key='***', "
@@ -264,6 +276,21 @@ class FabricSparkCredentials(Credentials):
                 raise DbtRuntimeError(
                     "Must specify `privy_notebook_url` in profile for method=privy"
                 )
+            if isinstance(self.privy_max_workers, bool) or not isinstance(
+                self.privy_max_workers, int
+            ):
+                raise DbtRuntimeError("privy_max_workers must be a positive integer.")
+            if self.privy_max_workers <= 0:
+                raise DbtRuntimeError("privy_max_workers must be a positive integer.")
+            if not isinstance(self.privy_serialize_inprocess, bool):
+                raise DbtRuntimeError("privy_serialize_inprocess must be a boolean.")
+            if self.privy_campaign_correlation_token is not None:
+                token = self.privy_campaign_correlation_token
+                if not isinstance(token, str) or not token.strip() or len(token) > 256:
+                    raise DbtRuntimeError(
+                        "privy_campaign_correlation_token must be a non-empty string "
+                        "of at most 256 characters."
+                    )
             self._validate_pool_priority_map()
 
         # schema defaults to lakehouse name if not provided by user.
@@ -435,7 +462,7 @@ class FabricSparkCredentials(Credentials):
 
     def _connection_keys(self) -> Tuple[str, ...]:
         # Intentionally excludes client_secret, accessToken, tenant_id,
-        # privy_relay_key, privy_relay_keyrule
+        # and all four Relay credential values.
         return (
             "workspaceid",
             "lakehouseid",
@@ -448,10 +475,11 @@ class FabricSparkCredentials(Credentials):
             "high_concurrency",
             "spark_config",
             "method",
-            "privy_relay_namespace",
-            "privy_relay_path",
             "privy_notebook_url",
             "privy_auto_start_notebook",
+            "privy_max_workers",
+            "privy_serialize_inprocess",
+            "privy_campaign_correlation_token",
             "privy_ready_timeout",
             "privy_pool_priority_map",
         )

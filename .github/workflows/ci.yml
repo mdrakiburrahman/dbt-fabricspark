@@ -2,6 +2,7 @@ name: Continuous Integration
 
 on:
   pull_request:
+  push:
   workflow_dispatch:
 
 concurrency:
@@ -10,19 +11,19 @@ concurrency:
 
 env:
   IS_GH_ACTION: "1"
-  CLIENT_ID: ${{ secrets.APP_ID }}
-  TENANT_ID: ${{ secrets.TENANT_ID }}
   FABRIC_API: "https://msitapi.fabric.microsoft.com/v1"
 
 permissions:
   contents: read
   packages: read
-  id-token: write
 
 jobs:
-  linux:
+  quality:
+    name: Credential-free quality
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      TMPDIR: ${{ github.workspace }}/.tmp
     container:
       image: dbtfabric.azurecr.io/devcontainer/spark:c30058bab7d446a30b78be86804639114f58edb0242a79c5e1400af912052265
       options: >-
@@ -43,21 +44,119 @@ jobs:
       - name: "🔒 Configure container permissions and PATH"
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p "$TMPDIR"
+
+      - name: "⚙️ Post create commands"
+        run: /tmp/overlay/post-create-commands.sh
+
+      - name: "⚙️ Post attach commands"
+        run: /tmp/overlay/post-attach-commands.sh
+
+      - name: "🔐 Verify lockfile"
+        run: uv lock --check
+
+      - name: "🐍 Compile Python"
+        run: python3 -m compileall -q src tests/unit
+
+      - name: "📦 Build and Twine-check package"
+        run: bash tools/scripts/run.sh build
+
+      - name: "🧹 Lint"
+        run: bash tools/scripts/run.sh lint
+
+      - name: "🧪 Unit tests"
+        run: bash tools/scripts/run.sh test:unit
+
+      - name: "🧪 Local end-to-end tests"
+        run: bash tools/scripts/run.sh test:local-e2e
+
+      - name: "🧹 Clean test scratch"
+        if: always()
+        run: rm -rf "$TMPDIR"
+
+      - name: "📁 Verify no untracked files"
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: npm run fail-on-untracked-files
+
+  integration-availability:
+    name: Live Fabric integration availability
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.credentials.outputs.configured }}
+    steps:
+      - name: Check live integration configuration
+        id: credentials
+        env:
+          APP_ID: ${{ secrets.APP_ID || vars.APP_ID }}
+          TENANT_ID: ${{ secrets.TENANT_ID || vars.TENANT_ID }}
+          WORKSPACE_ID_1: ${{ secrets.WORKSPACE_ID_1 || vars.WORKSPACE_ID_1 }}
+          WORKSPACE_NAME_1: ${{ secrets.WORKSPACE_NAME_1 || vars.WORKSPACE_NAME_1 }}
+          WORKSPACE_ID_2: ${{ secrets.WORKSPACE_ID_2 || vars.WORKSPACE_ID_2 }}
+          WORKSPACE_NAME_2: ${{ secrets.WORKSPACE_NAME_2 || vars.WORKSPACE_NAME_2 }}
+        run: |
+          if [[ -n "$APP_ID" &&
+                -n "$TENANT_ID" &&
+                -n "$WORKSPACE_ID_1" &&
+                -n "$WORKSPACE_NAME_1" &&
+                -n "$WORKSPACE_ID_2" &&
+                -n "$WORKSPACE_NAME_2" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Live Fabric integration is skipped because its required repository secrets or variables are not configured."
+          fi
+
+  live-fabric-integration:
+    name: Live Fabric integration
+    needs: integration-availability
+    if: needs.integration-availability.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TMPDIR: ${{ github.workspace }}/.tmp
+      CLIENT_ID: ${{ secrets.APP_ID || vars.APP_ID }}
+      TENANT_ID: ${{ secrets.TENANT_ID || vars.TENANT_ID }}
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    container:
+      image: dbtfabric.azurecr.io/devcontainer/spark:c30058bab7d446a30b78be86804639114f58edb0242a79c5e1400af912052265
+      options: >-
+        --cap-add=SYS_ADMIN
+        --device=/dev/fuse
+        --security-opt=apparmor:unconfined
+        --add-host=host.docker.internal:host-gateway
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: "🔒 Configure container permissions and PATH"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir -p "$TMPDIR"
 
       - name: "🔒 Auth: Azure login with OIDC"
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
         with:
-          client-id: ${{ secrets.APP_ID }}
-          tenant-id: ${{ secrets.TENANT_ID }}
+          client-id: ${{ secrets.APP_ID || vars.APP_ID }}
+          tenant-id: ${{ secrets.TENANT_ID || vars.TENANT_ID }}
           allow-no-subscriptions: true
 
       - name: "📝 Write test.env"
         run: |
           {
-            echo "WORKSPACE_ID_1=${{ secrets.WORKSPACE_ID_1 }}"
-            echo "WORKSPACE_NAME_1=${{ secrets.WORKSPACE_NAME_1 }}"
-            echo "WORKSPACE_ID_2=${{ secrets.WORKSPACE_ID_2 }}"
-            echo "WORKSPACE_NAME_2=${{ secrets.WORKSPACE_NAME_2 }}"
+            echo "WORKSPACE_ID_1=${{ secrets.WORKSPACE_ID_1 || vars.WORKSPACE_ID_1 }}"
+            echo "WORKSPACE_NAME_1=${{ secrets.WORKSPACE_NAME_1 || vars.WORKSPACE_NAME_1 }}"
+            echo "WORKSPACE_ID_2=${{ secrets.WORKSPACE_ID_2 || vars.WORKSPACE_ID_2 }}"
+            echo "WORKSPACE_NAME_2=${{ secrets.WORKSPACE_NAME_2 || vars.WORKSPACE_NAME_2 }}"
             echo "LIVY_ENDPOINT=${FABRIC_API}"
           } > "$GITHUB_WORKSPACE/test.env"
 
@@ -67,14 +166,9 @@ jobs:
       - name: "⚙️ Post attach commands"
         run: /tmp/overlay/post-attach-commands.sh
 
-      - name: "📦 Build Projects"
-        run: npx nx affected --base=origin/main -t build --parallel=3 --configuration=ci --output-style=stream --verbose
+      - name: "🧪 Live Fabric integration tests"
+        run: bash tools/scripts/run.sh test:functional
 
-      - name: "🧹 Lint Projects"
-        run: npx nx affected --base=origin/main -t lint --parallel=3 --configuration=ci --verbose --output-style=stream --verbose
-
-      - name: "🧪 Test Projects"
-        run: npx nx affected --base=origin/main -t test --configuration=ci --verbose --output-style=stream --verbose
-
-      - name: "📁 Verify No Untracked Files"
-        run: npm run fail-on-untracked-files
+      - name: "🧹 Clean test scratch"
+        if: always()
+        run: rm -rf "$TMPDIR"

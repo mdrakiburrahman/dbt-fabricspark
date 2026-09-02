@@ -3,6 +3,43 @@
 ## v1.13.1
 
 - POC hack, do NOT merge
+- Privy notebook auto-start now submits the complete typed Fabric Notebook
+  parameter set from the existing Relay credentials plus configurable
+  `privy_max_workers`, `privy_serialize_inprocess`, and the nonsecret
+  `privy_campaign_correlation_token`. It checks the latest five minutes of
+  paginated job history before submitting, reuses exactly one correlated
+  active run, rejects ambiguous matches, caches accepted job IDs immediately,
+  and reconciles ambiguous POST outcomes without retrying the POST. Parameter
+  rejection fails closed with no empty-body fallback. Every Job Scheduler
+  history, submit, pagination, and status request carries
+  `x-ms-fabric-skill: spark-cli`, and request bodies plus Relay credential
+  values are excluded from logs, exceptions, and credential representations.
+- Hardened notebook-job ownership around Fabric's documented history contract,
+  which does not expose submitted parameters. Auto-start now uses explicit
+  notebook-wide single-active-run semantics: only an active job whose ID and
+  campaign token match the adapter's local ownership ledger can be reused;
+  cache loss, another campaign, or multiple active jobs fail closed. A keyed
+  atomic cache and per-workspace/notebook/Relay-target interprocess lock cover
+  cache recheck, paginated history, one POST, reconciliation, and persistence.
+  Ambiguous transport failures plus HTTP 408/5xx responses enter bounded
+  evidence reconciliation without resubmitting, while deterministic 4xx
+  failures remain fail-closed.
+- Removed timing-only attribution from ambiguous notebook submission handling.
+  Only the server-returned `Location` job-instance ID can establish ownership;
+  `rootActivityId`, request IDs, and newly appearing history entries are retained
+  as sanitized structured ambiguity evidence but are never treated as a
+  documented POST correlation. Ambiguities without `Location` now fail safely
+  without retrying, adopting, cancelling, or caching any job. Every history page
+  and exact job-detail request is capped by the remaining 30-second budget, with
+  deadline checks before requests, between pages, and before sleeps so the
+  interprocess ownership lock is released within the advertised bound.
+- Propagated that same reconciliation deadline through exact-Location cache
+  persistence and the global mapping-lock acquisition. Cache read/write,
+  `fsync`, and atomic `replace` recheck the original remaining budget instead of
+  opening a fresh 60-second lock window while notebook/target locks are held.
+  Exhaustion returns the same sanitized structured ambiguity evidence, leaves no
+  ownership entry or temporary file, and releases every lock within the original
+  reconciliation contract.
 - Fixed Privy listener reconnects and Relay 404/504 responses causing dbt to resubmit
   already-running SQL. Submit retries now reuse one protocol request id and therefore
   one server job, while notebook-interpreter deduplication remains as a fallback for
