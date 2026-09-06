@@ -635,7 +635,7 @@ def _trigger_notebook_run_locked(
 
     url = (
         f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}"
-        f"/jobs/instances?jobType=RunNotebook"
+        f"/jobs/RunNotebook/instances"
     )
     logger.info(f"Privy relay not responding; triggering Fabric notebook run: POST {url}")
     body = _notebook_run_body(credentials, correlation_token=correlation_token)
