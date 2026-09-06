@@ -99,6 +99,7 @@ _PRIVY_TRANSIENT_HTTP_STATUSES = frozenset({404, 408, 429, 500, 502, 503, 504})
 _PRIVY_CONTROL_GRACE_S = 60.0
 _PRIVY_POLL_BACKOFF_MIN_S = 0.25
 _PRIVY_POLL_BACKOFF_MAX_S = 5.0
+_PRIVY_MAX_WARM_CONNECTIONS = 64
 
 # A 504/408/etc. on a poll's long-poll HTTP request is inherently ambiguous —
 # the relay may have dropped the response to an already-finished job. Rather
@@ -1417,6 +1418,7 @@ def _ensure_notebook_ready(exec_client: Any, credentials: FabricSparkCredentials
         if credentials.privy_auto_start_notebook:
             _validate_responding_relay_ownership(credentials)
         logger.debug("Privy relay already responding; reusing the existing notebook run.")
+        _warm_exec_client(exec_client, credentials)
         return
 
     job_ref: Optional[_NotebookJobRef] = None
@@ -1429,6 +1431,19 @@ def _ensure_notebook_ready(exec_client: Any, credentials: FabricSparkCredentials
         )
 
     _wait_for_relay(probe_client, credentials, job_ref)
+    _warm_exec_client(exec_client, credentials)
+
+
+def _warm_exec_client(exec_client: Any, credentials: FabricSparkCredentials) -> None:
+    warmup = getattr(exec_client, "warmup", None)
+    if not callable(warmup):
+        return
+    connection_count = min(
+        _PRIVY_MAX_WARM_CONNECTIONS,
+        max(1, int(credentials.privy_max_workers) // 2),
+    )
+    warmed = warmup(connection_count, timeout_s=_PROBE_HTTP_TIMEOUT_S)
+    logger.info(f"Privy relay prewarmed {warmed} HTTPS connection(s).")
 
 
 class PrivyConnectionManager:
