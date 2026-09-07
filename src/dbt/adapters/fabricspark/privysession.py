@@ -503,6 +503,11 @@ def _notebook_run_body(
                 "type": "Integer",
             },
             {
+                "name": "listener_connections",
+                "value": credentials.privy_listener_connections,
+                "type": "Integer",
+            },
+            {
                 "name": "serialize_inprocess",
                 "value": credentials.privy_serialize_inprocess,
                 "type": "Boolean",

@@ -153,6 +153,7 @@ class FabricSparkCredentials(Credentials):
     # Defaults match Privy's native non-benchmark behavior; high-concurrency
     # campaigns can opt into a larger worker pool from profiles.yml.
     privy_max_workers: int = 32
+    privy_listener_connections: int = 25
     privy_serialize_inprocess: bool = False
     # Nonsecret stable token used to reconcile one campaign's RunNotebook job.
     # When omitted, the adapter derives a stable target-scoped default.
@@ -199,6 +200,7 @@ class FabricSparkCredentials(Credentials):
             f"privy_relay_keyrule='***', "
             f"privy_notebook_url={self.privy_notebook_url!r}, "
             f"privy_max_workers={self.privy_max_workers!r}, "
+            f"privy_listener_connections={self.privy_listener_connections!r}, "
             f"privy_serialize_inprocess={self.privy_serialize_inprocess!r}, "
             f"privy_campaign_correlation_token={self.privy_campaign_correlation_token!r}, "
             f"privy_ready_timeout={self.privy_ready_timeout!r}, "
@@ -282,6 +284,16 @@ class FabricSparkCredentials(Credentials):
                 raise DbtRuntimeError("privy_max_workers must be a positive integer.")
             if self.privy_max_workers <= 0:
                 raise DbtRuntimeError("privy_max_workers must be a positive integer.")
+            if isinstance(self.privy_listener_connections, bool) or not isinstance(
+                self.privy_listener_connections, int
+            ):
+                raise DbtRuntimeError(
+                    "privy_listener_connections must be an integer from 1 to 25."
+                )
+            if not 1 <= self.privy_listener_connections <= 25:
+                raise DbtRuntimeError(
+                    "privy_listener_connections must be an integer from 1 to 25."
+                )
             if not isinstance(self.privy_serialize_inprocess, bool):
                 raise DbtRuntimeError("privy_serialize_inprocess must be a boolean.")
             if self.privy_campaign_correlation_token is not None:
@@ -478,6 +490,7 @@ class FabricSparkCredentials(Credentials):
             "privy_notebook_url",
             "privy_auto_start_notebook",
             "privy_max_workers",
+            "privy_listener_connections",
             "privy_serialize_inprocess",
             "privy_campaign_correlation_token",
             "privy_ready_timeout",
