@@ -281,6 +281,8 @@ class FabricSparkConnectionManager(SQLConnectionManager):
                     if creds.token is not None:
                         msg += ", is your token valid?"
                     raise FailedToConnectError(msg) from e
+                if _is_permanent_error(e):
+                    raise FailedToConnectError(str(e)) from e
                 retryable_message = _is_retryable_error(e)
                 if retryable_message and creds.connect_retries > 0:
                     msg = (
