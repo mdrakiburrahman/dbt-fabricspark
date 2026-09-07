@@ -30,6 +30,14 @@ def test_unsupported_feature_is_permanent_error() -> None:
     assert _is_permanent_error(exc) is True
 
 
+def test_malformed_notebook_payload_is_permanent_error() -> None:
+    exc = DbtDatabaseError(
+        "Fabric notebook run Failed before the Privy relay came up. "
+        "errorCode=NotebookBadWebRequest."
+    )
+    assert _is_permanent_error(exc) is True
+
+
 def _credentials(**overrides):
     values = {
         "statement_timeout": 30,

@@ -641,6 +641,7 @@ _PERMANENT_SPARK_ERROR_CODES = (
     "[group_by_aggregate]",
     "[unable_to_acquire_memory]",
     "[unsupported_feature.",
+    "notebookbadwebrequest",
     "java.lang.outofmemoryerror",
     "sparkoutofmemoryerror",
 )
