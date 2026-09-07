@@ -503,11 +503,6 @@ def _notebook_run_body(
                 "type": "Integer",
             },
             {
-                "name": "listener_connections",
-                "value": credentials.privy_listener_connections,
-                "type": "Integer",
-            },
-            {
                 "name": "serialize_inprocess",
                 "value": credentials.privy_serialize_inprocess,
                 "type": "Boolean",
@@ -639,7 +634,7 @@ def _trigger_notebook_run_locked(
         _clear_cached_job_ref(cached_ref, deadline=ownership_deadline)
 
     url = (
-        f"{credentials.endpoint}/workspaces/{workspace_id}/items/{notebook_id}"
+        f"{credentials.endpoint}/workspaces/{workspace_id}/notebooks/{notebook_id}"
         f"/jobs/execute/instances?beta=false"
     )
     logger.info(f"Privy relay not responding; triggering Fabric notebook run: POST {url}")

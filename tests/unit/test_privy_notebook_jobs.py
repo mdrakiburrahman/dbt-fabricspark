@@ -251,7 +251,6 @@ def test_notebook_parameter_payload_uses_existing_credentials_and_typed_settings
             {"name": "relay_key_rule", "value": "fake-relay-rule", "type": "Text"},
             {"name": "relay_key", "value": "fake-relay-secret", "type": "Text"},
             {"name": "max_workers", "value": 64, "type": "Integer"},
-            {"name": "listener_connections", "value": 25, "type": "Integer"},
             {"name": "serialize_inprocess", "value": False, "type": "Boolean"},
             {
                 "name": "campaign_correlation_token",
