@@ -651,6 +651,17 @@ name. Older extensions, four-part targets, and explicit rebuilds keep the
 original path. An absent target uses the original create path; an execution
 failure, definition mismatch, or invalid lifecycle proof is not retried.
 
+Custom materializations can separately check
+`adapter.supports_guarded_materialized_view_eligibility()` before issuing the
+read-only `SHOW OPENIVM REFRESH ELIGIBILITY <target> EXPECT QUERY HASH '<hash>'`
+probe. Pass its result, the lowercase 32-character hash, and the fully quoted
+target to `adapter.materialized_view_refresh_is_eligible(...)`. A false result
+requires the ordinary lifecycle; it does not prove absence or a completed
+refresh. Malformed results and probe errors fail closed. Eligibility does not
+replace the guarded refresh's own identity checks, and a failed guarded refresh
+must not fall back or be retried. The built-in materialization does not use this
+probe.
+
 ### Configuration Reference
 
 | Option                           | Type   | Default                               | Description                                                                                                                                                                                                                                                                                                                                                                                                      |

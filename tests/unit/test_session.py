@@ -108,6 +108,29 @@ def test_openivm_capability_is_reused_only_for_the_same_spark_session():
         connection.supports_openivm_guarded_refresh(lookup)
 
 
+def test_eligibility_capability_cache_is_independent_and_session_scoped():
+    spark = MagicMock()
+    connection = _make_session_connection(spark)
+    v2_lookup = MagicMock(return_value=True)
+    eligibility_lookup = MagicMock(side_effect=[FakeAnalysisException("probe failed"), False, True])
+    assert connection.supports_openivm_guarded_refresh(v2_lookup)
+    with pytest.raises(FakeAnalysisException, match="probe failed"):
+        connection.supports_openivm_guarded_refresh_eligibility(eligibility_lookup)
+    assert not connection.supports_openivm_guarded_refresh_eligibility(eligibility_lookup)
+    assert not _make_session_connection(spark).supports_openivm_guarded_refresh_eligibility(
+        eligibility_lookup
+    )
+    assert _make_session_connection(MagicMock()).supports_openivm_guarded_refresh_eligibility(
+        eligibility_lookup
+    )
+    assert eligibility_lookup.call_count == 3
+    assert connection.supports_openivm_guarded_refresh(v2_lookup)
+    assert v2_lookup.call_count == 1
+    connection.mark_fail_fast_cancelled()
+    with pytest.raises(DbtRuntimeError, match="cancelled"):
+        connection.supports_openivm_guarded_refresh_eligibility(eligibility_lookup)
+
+
 def test_credentials_session_mode() -> None:
     with patch("dbt.adapters.fabricspark.credentials.import_module", return_value=object()):
         credentials = FabricSparkCredentials(

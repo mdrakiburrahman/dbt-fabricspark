@@ -294,16 +294,25 @@ class SessionCursor:
 
 class SessionConnection:
     _openivm_capabilities: WeakKeyDictionary = WeakKeyDictionary()
+    _openivm_eligibility_capabilities: WeakKeyDictionary = WeakKeyDictionary()
     _capability_lock = threading.Lock()
 
     def supports_openivm_guarded_refresh(self, discover: Callable[[], bool]) -> bool:
+        return self._supports_openivm_capability(discover, self._openivm_capabilities)
+
+    def supports_openivm_guarded_refresh_eligibility(self, discover: Callable[[], bool]) -> bool:
+        return self._supports_openivm_capability(discover, self._openivm_eligibility_capabilities)
+
+    def _supports_openivm_capability(
+        self, discover: Callable[[], bool], cache: WeakKeyDictionary
+    ) -> bool:
         self.require_not_cancelled()
         with self._capability_lock:
             self.require_not_cancelled()
             session = self._spark_session
-            if session not in self._openivm_capabilities:
-                self._openivm_capabilities[session] = discover()
-            return self._openivm_capabilities[session]
+            if session not in cache:
+                cache[session] = discover()
+            return cache[session]
 
     def __init__(self, *, spark_config: dict[str, Any]) -> None:
         self._fail_fast_cancelled = threading.Event()

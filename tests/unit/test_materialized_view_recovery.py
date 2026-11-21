@@ -8,6 +8,7 @@ from dbt_common.exceptions import CompilationError, DbtRuntimeError
 from jinja2 import Environment
 
 from dbt.adapters.fabricspark import FabricSparkAdapter
+from dbt.adapters.fabricspark.session import SessionConnectionWrapper
 
 QUERY_HASH = "a" * 32
 MACRO = (
@@ -138,6 +139,142 @@ def test_probe_matches_exact_guarded_refresh_capability(advertised, supported):
     adapter.execute.assert_called_once_with(
         "SET spark.openivm.capabilities", auto_begin=False, fetch=True
     )
+
+
+@pytest.mark.parametrize(
+    ("advertised", "supported"),
+    [
+        ("<undefined>", False),
+        ("ensure_refresh_v2", False),
+        ("ensure_refresh_eligibility_v10", False),
+        ("ensure_refresh_v2, ensure_refresh_eligibility_v1", True),
+    ],
+)
+def test_eligibility_capability_requires_its_own_exact_token(advertised, supported):
+    adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.execute.return_value = (
+        None,
+        agate.Table([["spark.openivm.capabilities", advertised]], ["key", "value"]),
+    )
+    assert FabricSparkAdapter._discover_guarded_refresh_eligibility(adapter) is supported
+    adapter.execute.assert_called_once_with(
+        "SET spark.openivm.capabilities", auto_begin=False, fetch=True
+    )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        agate.Table([], ["key", "value"]),
+        agate.Table([["unexpected", "ensure_refresh_eligibility_v1"]], ["key", "value"]),
+        agate.Table([["spark.openivm.capabilities", None]], ["key", "value"]),
+        agate.Table([["spark.openivm.capabilities", "x"]], ["wrong", "value"]),
+    ],
+)
+def test_eligibility_capability_probe_rejects_malformed_results(result):
+    adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.execute.return_value = (None, result)
+    with pytest.raises(DbtRuntimeError, match="OpenIVM extension capabilit"):
+        FabricSparkAdapter._discover_guarded_refresh_eligibility(adapter)
+
+
+def test_eligibility_capability_is_only_available_to_session_connections():
+    adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.connections.get_thread_connection.return_value.handle = object()
+    assert not FabricSparkAdapter.supports_guarded_materialized_view_eligibility(adapter)
+    adapter.execute.assert_not_called()
+    wrapper = MagicMock(spec=SessionConnectionWrapper)
+    wrapper.handle.supports_openivm_guarded_refresh_eligibility.return_value = True
+    adapter.connections.get_thread_connection.return_value.handle = wrapper
+    assert FabricSparkAdapter.supports_guarded_materialized_view_eligibility(adapter)
+    wrapper.handle.supports_openivm_guarded_refresh_eligibility.assert_called_once_with(
+        adapter._discover_guarded_refresh_eligibility
+    )
+
+
+ELIGIBILITY_COLUMNS = ("status", "query_hash", "target", "target_table_id", "reason")
+ELIGIBILITY_TARGET = "`Analytics.QA`.`d``bo`.`mv_example`"
+
+
+def _eligibility_result(rows, columns=ELIGIBILITY_COLUMNS):
+    return agate.Table(rows, columns, column_types=[agate.Text()] * len(columns))
+
+
+@pytest.mark.parametrize(
+    ("status", "table_id", "reason", "expected"),
+    [
+        ("eligible", "table-id", None, True),
+        ("lifecycle_required", None, "registration_missing", False),
+        ("lifecycle_required", None, "legacy_identity_missing", False),
+        ("lifecycle_required", None, "query_hash_policy", False),
+        ("lifecycle_required", None, "public_relation_missing", False),
+        ("lifecycle_required", None, "async_unsupported", False),
+    ],
+)
+def test_eligibility_requires_exact_authoritative_disposition(status, table_id, reason, expected):
+    result = _eligibility_result([[status, QUERY_HASH, ELIGIBILITY_TARGET, table_id, reason]])
+    assert (
+        FabricSparkAdapter.materialized_view_refresh_is_eligible(
+            None, result, QUERY_HASH, ELIGIBILITY_TARGET
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        ["eligible", QUERY_HASH, ELIGIBILITY_TARGET, None, None],
+        ["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "   ", None],
+        ["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "table-id", "registration_missing"],
+        ["lifecycle_required", QUERY_HASH, ELIGIBILITY_TARGET, "table-id", "registration_missing"],
+        ["lifecycle_required", QUERY_HASH, ELIGIBILITY_TARGET, None, None],
+        ["lifecycle_required", QUERY_HASH, ELIGIBILITY_TARGET, None, "unknown"],
+        ["absent", QUERY_HASH, ELIGIBILITY_TARGET, None, None],
+        ["eligible", "b" * 32, ELIGIBILITY_TARGET, "table-id", None],
+        ["eligible", QUERY_HASH, "`other`.`dbo`.`mv_example`", "table-id", None],
+    ],
+)
+def test_eligibility_rejects_forged_or_unrecognized_proofs(row):
+    with pytest.raises(DbtRuntimeError, match="invalid"):
+        FabricSparkAdapter.materialized_view_refresh_is_eligible(
+            None, _eligibility_result([row]), QUERY_HASH, ELIGIBILITY_TARGET
+        )
+
+
+@pytest.mark.parametrize(
+    ("result", "query_hash", "target"),
+    [
+        (None, QUERY_HASH, ELIGIBILITY_TARGET),
+        (_eligibility_result([]), QUERY_HASH, ELIGIBILITY_TARGET),
+        (
+            _eligibility_result([["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "id", None]] * 2),
+            QUERY_HASH,
+            ELIGIBILITY_TARGET,
+        ),
+        (
+            _eligibility_result(
+                [["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "id", None]],
+                ("reason", "query_hash", "target", "target_table_id", "status"),
+            ),
+            QUERY_HASH,
+            ELIGIBILITY_TARGET,
+        ),
+        (
+            _eligibility_result([["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "id", None]]),
+            "A" * 32,
+            ELIGIBILITY_TARGET,
+        ),
+        (
+            _eligibility_result([["eligible", QUERY_HASH, ELIGIBILITY_TARGET, "id", None]]),
+            QUERY_HASH,
+            "analytics.dbo.mv_example",
+        ),
+    ],
+)
+def test_eligibility_rejects_invalid_shapes_and_expected_identities(result, query_hash, target):
+    with pytest.raises(DbtRuntimeError, match="invalid"):
+        FabricSparkAdapter.materialized_view_refresh_is_eligible(None, result, query_hash, target)
 
 
 @pytest.mark.parametrize(
