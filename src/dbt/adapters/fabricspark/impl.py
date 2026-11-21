@@ -289,7 +289,9 @@ class FabricSparkAdapter(SQLAdapter):
             or tuple(result.column_names) != columns
             or len(result.rows) != 1
         ):
-            raise DbtRuntimeError("Materialized view refresh eligibility returned an invalid result")
+            raise DbtRuntimeError(
+                "Materialized view refresh eligibility returned an invalid result"
+            )
         if (
             not isinstance(query_hash, str)
             or re.fullmatch(r"[0-9a-f]{32}", query_hash) is None
@@ -299,8 +301,15 @@ class FabricSparkAdapter(SQLAdapter):
             raise DbtRuntimeError("Materialized view refresh eligibility has an invalid identity")
         status, observed_hash, target, table_id, reason = result.rows[0]
         if observed_hash != query_hash or target != expected_target:
-            raise DbtRuntimeError("Materialized view refresh eligibility returned an invalid identity")
-        if status == "eligible" and isinstance(table_id, str) and table_id.strip() and reason is None:
+            raise DbtRuntimeError(
+                "Materialized view refresh eligibility returned an invalid identity"
+            )
+        if (
+            status == "eligible"
+            and isinstance(table_id, str)
+            and table_id.strip()
+            and reason is None
+        ):
             return True
         if (
             status == "lifecycle_required"
@@ -309,7 +318,9 @@ class FabricSparkAdapter(SQLAdapter):
             and reason in GUARDED_REFRESH_LIFECYCLE_REASONS
         ):
             return False
-        raise DbtRuntimeError("Materialized view refresh eligibility returned an invalid disposition")
+        raise DbtRuntimeError(
+            "Materialized view refresh eligibility returned an invalid disposition"
+        )
 
     @available
     @measure_adapter_phase("adapter.query_hash")

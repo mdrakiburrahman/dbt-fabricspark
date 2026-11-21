@@ -112,7 +112,9 @@ def test_eligibility_capability_cache_is_independent_and_session_scoped():
     spark = MagicMock()
     connection = _make_session_connection(spark)
     v2_lookup = MagicMock(return_value=True)
-    eligibility_lookup = MagicMock(side_effect=[FakeAnalysisException("probe failed"), False, True])
+    eligibility_lookup = MagicMock(
+        side_effect=[FakeAnalysisException("probe failed"), False, True]
+    )
     assert connection.supports_openivm_guarded_refresh(v2_lookup)
     with pytest.raises(FakeAnalysisException, match="probe failed"):
         connection.supports_openivm_guarded_refresh_eligibility(eligibility_lookup)

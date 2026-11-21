@@ -180,10 +180,11 @@ def test_eligibility_capability_probe_rejects_malformed_results(result):
 
 def test_eligibility_capability_is_only_available_to_session_connections():
     adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.connections = MagicMock()
     adapter.connections.get_thread_connection.return_value.handle = object()
     assert not FabricSparkAdapter.supports_guarded_materialized_view_eligibility(adapter)
     adapter.execute.assert_not_called()
-    wrapper = MagicMock(spec=SessionConnectionWrapper)
+    wrapper = SessionConnectionWrapper(MagicMock())
     wrapper.handle.supports_openivm_guarded_refresh_eligibility.return_value = True
     adapter.connections.get_thread_connection.return_value.handle = wrapper
     assert FabricSparkAdapter.supports_guarded_materialized_view_eligibility(adapter)
@@ -239,6 +240,18 @@ def test_eligibility_rejects_forged_or_unrecognized_proofs(row):
     with pytest.raises(DbtRuntimeError, match="invalid"):
         FabricSparkAdapter.materialized_view_refresh_is_eligible(
             None, _eligibility_result([row]), QUERY_HASH, ELIGIBILITY_TARGET
+        )
+
+
+def test_eligibility_rejects_non_string_table_identity():
+    result = agate.Table(
+        [["eligible", QUERY_HASH, ELIGIBILITY_TARGET, 123, None]],
+        ELIGIBILITY_COLUMNS,
+        column_types=[agate.Text(), agate.Text(), agate.Text(), agate.Number(), agate.Text()],
+    )
+    with pytest.raises(DbtRuntimeError, match="invalid disposition"):
+        FabricSparkAdapter.materialized_view_refresh_is_eligible(
+            None, result, QUERY_HASH, ELIGIBILITY_TARGET
         )
 
 
