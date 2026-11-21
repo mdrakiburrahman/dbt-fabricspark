@@ -295,6 +295,7 @@ class SessionCursor:
 class SessionConnection:
     _openivm_capabilities: WeakKeyDictionary = WeakKeyDictionary()
     _openivm_eligibility_capabilities: WeakKeyDictionary = WeakKeyDictionary()
+    _openivm_table_id_capabilities: WeakKeyDictionary = WeakKeyDictionary()
     _capability_lock = threading.Lock()
 
     def supports_openivm_guarded_refresh(self, discover: Callable[[], bool]) -> bool:
@@ -302,6 +303,9 @@ class SessionConnection:
 
     def supports_openivm_guarded_refresh_eligibility(self, discover: Callable[[], bool]) -> bool:
         return self._supports_openivm_capability(discover, self._openivm_eligibility_capabilities)
+
+    def supports_openivm_guarded_refresh_table_id(self, discover: Callable[[], bool]) -> bool:
+        return self._supports_openivm_capability(discover, self._openivm_table_id_capabilities)
 
     def _supports_openivm_capability(
         self, discover: Callable[[], bool], cache: WeakKeyDictionary

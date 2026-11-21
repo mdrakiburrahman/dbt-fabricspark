@@ -662,6 +662,15 @@ replace the guarded refresh's own identity checks, and a failed guarded refresh
 must not fall back or be retried. The built-in materialization does not use this
 probe.
 
+Before issuing a table-ID-pinned strict refresh, custom materializations can
+check `adapter.supports_guarded_materialized_view_refresh_table_id()`. It checks
+the independent `ensure_refresh_table_id_v1` capability on `method: session`
+connections only; v2 or eligibility support does not imply it. Pass an eligible
+probe result to `adapter.materialized_view_refresh_eligible_table_id(...)` to
+obtain its exact canonical Delta UUID. A valid lifecycle decline returns `None`;
+a malformed or non-canonical eligible ID raises an error. This helper does not
+cache identity or perform a strict refresh.
+
 ### Configuration Reference
 
 | Option                           | Type   | Default                               | Description                                                                                                                                                                                                                                                                                                                                                                                                      |

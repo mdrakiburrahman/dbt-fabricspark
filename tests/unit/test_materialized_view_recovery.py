@@ -193,8 +193,46 @@ def test_eligibility_capability_is_only_available_to_session_connections():
     )
 
 
+@pytest.mark.parametrize(
+    ("advertised", "supported"),
+    [
+        ("<undefined>", False),
+        ("ensure_refresh_v2, ensure_refresh_eligibility_v1", False),
+        ("ensure_refresh_table_id_v10", False),
+        ("ensure_refresh_table_id_v1", True),
+        ("ensure_refresh_v2, ensure_refresh_table_id_v1", True),
+    ],
+)
+def test_table_id_capability_requires_its_own_exact_token(advertised, supported):
+    adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.execute.return_value = (
+        None,
+        agate.Table([["spark.openivm.capabilities", advertised]], ["key", "value"]),
+    )
+    assert FabricSparkAdapter._discover_guarded_refresh_table_id(adapter) is supported
+    adapter.execute.assert_called_once_with(
+        "SET spark.openivm.capabilities", auto_begin=False, fetch=True
+    )
+
+
+def test_table_id_capability_is_only_available_to_session_connections():
+    adapter = MagicMock(spec=FabricSparkAdapter)
+    adapter.connections = MagicMock()
+    adapter.connections.get_thread_connection.return_value.handle = object()
+    assert not FabricSparkAdapter.supports_guarded_materialized_view_refresh_table_id(adapter)
+    adapter.execute.assert_not_called()
+    wrapper = SessionConnectionWrapper(MagicMock())
+    wrapper.handle.supports_openivm_guarded_refresh_table_id.return_value = True
+    adapter.connections.get_thread_connection.return_value.handle = wrapper
+    assert FabricSparkAdapter.supports_guarded_materialized_view_refresh_table_id(adapter)
+    wrapper.handle.supports_openivm_guarded_refresh_table_id.assert_called_once_with(
+        adapter._discover_guarded_refresh_table_id
+    )
+
+
 ELIGIBILITY_COLUMNS = ("status", "query_hash", "target", "target_table_id", "reason")
 ELIGIBILITY_TARGET = "`Analytics.QA`.`d``bo`.`mv_example`"
+DELTA_TABLE_ID = "79097174-f726-45b5-af69-134c6ba73333"
 
 
 def _eligibility_result(rows, columns=ELIGIBILITY_COLUMNS):
@@ -252,6 +290,39 @@ def test_eligibility_rejects_non_string_table_identity():
     with pytest.raises(DbtRuntimeError, match="invalid disposition"):
         FabricSparkAdapter.materialized_view_refresh_is_eligible(
             None, result, QUERY_HASH, ELIGIBILITY_TARGET
+        )
+
+
+def test_eligible_table_id_returns_exact_canonical_uuid():
+    result = _eligibility_result(
+        [["eligible", QUERY_HASH, ELIGIBILITY_TARGET, DELTA_TABLE_ID, None]]
+    )
+    assert (
+        object.__new__(FabricSparkAdapter).materialized_view_refresh_eligible_table_id(
+            result, QUERY_HASH, ELIGIBILITY_TARGET
+        )
+        == DELTA_TABLE_ID
+    )
+
+
+def test_eligible_table_id_returns_none_for_valid_lifecycle_decline():
+    result = _eligibility_result(
+        [["lifecycle_required", QUERY_HASH, ELIGIBILITY_TARGET, None, "registration_missing"]]
+    )
+    assert (
+        object.__new__(FabricSparkAdapter).materialized_view_refresh_eligible_table_id(
+            result, QUERY_HASH, ELIGIBILITY_TARGET
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("table_id", ["not-a-uuid", "79097174F72645B5AF69134C6BA73333"])
+def test_eligible_table_id_rejects_noncanonical_uuid(table_id):
+    result = _eligibility_result([["eligible", QUERY_HASH, ELIGIBILITY_TARGET, table_id, None]])
+    with pytest.raises(DbtRuntimeError, match="invalid Delta table ID"):
+        object.__new__(FabricSparkAdapter).materialized_view_refresh_eligible_table_id(
+            result, QUERY_HASH, ELIGIBILITY_TARGET
         )
 
 

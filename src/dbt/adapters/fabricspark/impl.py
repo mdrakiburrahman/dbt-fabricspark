@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
@@ -251,6 +252,21 @@ class FabricSparkAdapter(SQLAdapter):
         return _has_openivm_capability(self.execute, "ensure_refresh_eligibility_v1")
 
     @available
+    @measure_adapter_phase("adapter.guarded_refresh_table_id_capability")
+    def supports_guarded_materialized_view_refresh_table_id(self) -> bool:
+        from dbt.adapters.fabricspark.session import SessionConnectionWrapper
+
+        wrapper = self.connections.get_thread_connection().handle
+        if not isinstance(wrapper, SessionConnectionWrapper):
+            return False
+        return wrapper.handle.supports_openivm_guarded_refresh_table_id(
+            self._discover_guarded_refresh_table_id
+        )
+
+    def _discover_guarded_refresh_table_id(self) -> bool:
+        return _has_openivm_capability(self.execute, "ensure_refresh_table_id_v1")
+
+    @available
     def run_guarded_materialized_view_refresh(self, caller) -> str:
         with FabricSparkConnectionManager.no_retry():
             return caller()
@@ -321,6 +337,22 @@ class FabricSparkAdapter(SQLAdapter):
         raise DbtRuntimeError(
             "Materialized view refresh eligibility returned an invalid disposition"
         )
+
+    @available
+    def materialized_view_refresh_eligible_table_id(
+        self, result: "agate.Table", query_hash: str, expected_target: str
+    ) -> Optional[str]:
+        if not self.materialized_view_refresh_is_eligible(result, query_hash, expected_target):
+            return None
+        table_id = result.rows[0][3]
+        try:
+            if str(uuid.UUID(table_id)) != table_id:
+                raise ValueError("non-canonical UUID")
+        except ValueError as exc:
+            raise DbtRuntimeError(
+                "Materialized view refresh eligibility returned an invalid Delta table ID"
+            ) from exc
+        return table_id
 
     @available
     @measure_adapter_phase("adapter.query_hash")
